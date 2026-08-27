@@ -1,3 +1,4 @@
 *.swp
 /build
 influxdb-relay
+influxdb-relay.conf
