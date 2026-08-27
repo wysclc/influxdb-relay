@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"syscall"
 
 	"github.com/influxdata/influxdb-relay/relay"
 )
@@ -18,14 +19,14 @@ func main() {
 	flag.Parse()
 
 	if *configFile == "" {
-		fmt.Fprintln(os.Stderr, "Missing configuration file")
+		fmt.Fprintln(os.Stderr, "缺少配置文件")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
 	cfg, err := relay.LoadConfigFile(*configFile)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Problem loading config file:", err)
+		log.Fatalf("加载配置文件失败: %v", err)
 	}
 
 	r, err := relay.New(cfg)
@@ -34,13 +35,14 @@ func main() {
 	}
 
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
 
 	go func() {
 		<-sigChan
 		r.Stop()
 	}()
 
-	log.Println("starting relays...")
+	log.Println("正在启动 relays...")
 	r.Run()
 }

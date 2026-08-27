@@ -58,8 +58,10 @@ func (s *Service) Run() {
 }
 
 func (s *Service) Stop() {
-	for _, v := range s.relays {
-		v.Stop()
+	for name, relay := range s.relays {
+		if err := relay.Stop(); err != nil {
+			log.Printf("停止 relay %q 失败: %v", name, err)
+		}
 	}
 }
 
