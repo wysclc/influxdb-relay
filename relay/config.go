@@ -42,7 +42,8 @@ type HTTPOutputConfig struct {
 	// The format used is the same seen in time.ParseDuration
 	Timeout string `toml:"timeout"`
 
-	// BufferSizeMB 是该后端持久化待投递队列的容量上限。
+	// BufferSizeMB 是该后端持久化待投递队列的目标容量上限。
+	// 空间不足时淘汰最老记录，单条超限记录仍会作为最新记录保留。
 	// 为所有 HTTP output 配置正值后启用独立持久化和异步投递。
 	BufferSizeMB int `toml:"buffer-size-mb"`
 

@@ -288,13 +288,8 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, err := h.queue.enqueue(outBytes, query, authHeader)
 		putBuf(outBuf)
 		if err != nil {
-			if errors.Is(err, ErrBufferFull) {
-				w.Header().Set("Retry-After", "1")
-				jsonError(w, http.StatusServiceUnavailable, "所有 output 的持久化队列均已满，请稍后重试")
-			} else {
-				log.Printf("HTTP relay %q 写入持久化队列失败: %v", h.Name(), err)
-				jsonError(w, http.StatusServiceUnavailable, "无法持久化写入请求")
-			}
+			log.Printf("HTTP relay %q 写入持久化队列失败: %v", h.Name(), err)
+			jsonError(w, http.StatusServiceUnavailable, "无法持久化写入请求")
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)

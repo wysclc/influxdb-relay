@@ -26,7 +26,8 @@ bind-addr = "127.0.0.1:9096"
 #   name：output 的唯一名称，用于日志；持久化模式下也是 bucket 标识，有积压时不要改名。
 #   location：完整写入地址，必须包含 InfluxDB/Kapacitor 的 /write 路径。
 #   timeout：单次后端 HTTP 请求超时，支持 "500ms"、"10s"、"1m"，默认 10s。
-#   buffer-size-mb：单个 output 的活动持久化队列上限；0 表示兼容性的同步模式。
+#   buffer-size-mb：单个 output 的活动持久化队列目标容量；空间不足时淘汰最老记录。
+#                   0 表示兼容性的同步模式。
 #                   同一个 HTTP relay 必须全部为 0，或全部配置为正数，不能混用。
 #   max-batch-kb：持久化 worker 一次合并投递的最大正文，默认 512KB。
 #   max-delay-interval：网络错误、408、425、429、5xx 的最大重试间隔，默认 10s。

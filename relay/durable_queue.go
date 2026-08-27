@@ -28,9 +28,6 @@ var (
 	metaBucket      = []byte("meta")
 	activeBytesKey  = []byte("active-bytes")
 	deadBytesKey    = []byte("dead-bytes")
-
-	// ErrBufferFull 表示所有 output 的持久化队列都已经达到配置上限。
-	ErrBufferFull = errors.New("durable queue full")
 )
 
 type durableRecord struct {
@@ -47,12 +44,17 @@ type durableBatch struct {
 }
 
 type enqueueResult struct {
-	accepted []string
-	full     []string
+	evicted []evictedOutput
 }
 
-// durableQueue 在一个 BoltDB 事务中把请求写入所有尚有空间的 output。
-// 每个 output 使用独立 bucket 和 worker，队列满或远端故障不会阻塞其他 output。
+type evictedOutput struct {
+	name    string
+	records int
+	bytes   int64
+}
+
+// durableQueue 在一个 BoltDB 事务中把最新请求写入所有 output。
+// 空间不足时淘汰最老的待投递记录，每个 output 始终保留最新数据。
 type durableQueue struct {
 	db       *bolt.DB
 	path     string
@@ -130,7 +132,6 @@ func newDurableQueue(path string, backends []*httpBackend) (*durableQueue, error
 
 func (q *durableQueue) enqueue(body []byte, query, auth string) (enqueueResult, error) {
 	var result enqueueResult
-	var acceptedBackends []*httpBackend
 	payload, err := encodeRecord(durableRecord{query: query, auth: auth, body: body})
 	if err != nil {
 		return result, err
@@ -140,21 +141,33 @@ func (q *durableQueue) enqueue(body []byte, query, auth string) (enqueueResult, 
 	err = q.db.Update(func(tx *bolt.Tx) error {
 		root := tx.Bucket(queueRootBucket)
 
-		// 队列满的 output 跳过本次记录，其他 output 继续在同一事务中入队。
+		// 先为每个 output 淘汰最老记录，再写入最新记录。
 		for _, backend := range q.backends {
 			output := root.Bucket([]byte(backend.name))
-			active := readCounter(output.Bucket(metaBucket), activeBytesKey)
-			if active+recordBytes > backend.maxBuffered {
-				result.full = append(result.full, backend.name)
-				continue
-			}
-			result.accepted = append(result.accepted, backend.name)
-			acceptedBackends = append(acceptedBackends, backend)
-		}
-
-		for _, backend := range acceptedBackends {
-			output := root.Bucket([]byte(backend.name))
 			pending := output.Bucket(pendingBucket)
+			meta := output.Bucket(metaBucket)
+			active := readCounter(meta, activeBytesKey)
+			evicted := evictedOutput{name: backend.name}
+
+			cursor := pending.Cursor()
+			for active+recordBytes > backend.maxBuffered {
+				key, value := cursor.First()
+				if key == nil {
+					active = 0
+					break
+				}
+				size := int64(len(key) + len(value))
+				if err := cursor.Delete(); err != nil {
+					return err
+				}
+				active -= size
+				evicted.records++
+				evicted.bytes += size
+			}
+			if active < 0 {
+				active = 0
+			}
+
 			sequence, err := pending.NextSequence()
 			if err != nil {
 				return err
@@ -162,9 +175,11 @@ func (q *durableQueue) enqueue(body []byte, query, auth string) (enqueueResult, 
 			if err := pending.Put(sequenceKey(sequence), payload); err != nil {
 				return err
 			}
-			meta := output.Bucket(metaBucket)
-			if err := writeCounter(meta, activeBytesKey, readCounter(meta, activeBytesKey)+recordBytes); err != nil {
+			if err := writeCounter(meta, activeBytesKey, active+recordBytes); err != nil {
 				return err
+			}
+			if evicted.records > 0 {
+				result.evicted = append(result.evicted, evicted)
 			}
 		}
 		return nil
@@ -172,12 +187,8 @@ func (q *durableQueue) enqueue(body []byte, query, auth string) (enqueueResult, 
 	if err != nil {
 		return enqueueResult{}, err
 	}
-	if len(result.accepted) == 0 {
-		return result, fmt.Errorf("%w: all %d outputs", ErrBufferFull, len(result.full))
-	}
-
-	for _, name := range result.accepted {
-		q.wake(name)
+	for _, backend := range q.backends {
+		q.wake(backend.name)
 	}
 	return result, nil
 }

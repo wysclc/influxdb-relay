@@ -83,7 +83,7 @@ func TestDurableQueueIsolatesFailedOutput(t *testing.T) {
 	}
 }
 
-func TestDurableQueueSkipsOnlyFullOutput(t *testing.T) {
+func TestDurableQueueEvictsOldestRecordsPerOutput(t *testing.T) {
 	payload, err := encodeRecord(durableRecord{query: "db=test", body: []byte("cpu value=1i 1\n")})
 	if err != nil {
 		t.Fatal(err)
@@ -105,27 +105,28 @@ func TestDurableQueueSkipsOnlyFullOutput(t *testing.T) {
 
 	result, err := queue.enqueue([]byte("cpu value=2i 2\n"), "db=test", "")
 	if err != nil {
-		t.Fatalf("仍有 output 可接收时不应返回错误: %v", err)
+		t.Fatalf("第二次入队失败: %v", err)
 	}
-	if len(result.accepted) != 1 || result.accepted[0] != "second" {
-		t.Fatalf("第二次写入的接收 output 错误: %#v", result.accepted)
-	}
-	if len(result.full) != 1 || result.full[0] != "first" {
-		t.Fatalf("第二次写入的满队列 output 错误: %#v", result.full)
+	if len(result.evicted) != 1 || result.evicted[0].name != "first" || result.evicted[0].records != 1 {
+		t.Fatalf("第二次写入的淘汰结果错误: %#v", result.evicted)
 	}
 	firstActive, _ := queueBytes(t, queue, "first")
 	secondActive, _ := queueBytes(t, queue, "second")
 	if firstActive != limit || secondActive != limit*2 {
 		t.Fatalf("各 output 入队结果错误: first=%d second=%d", firstActive, secondActive)
 	}
+	assertPendingBodies(t, queue, "first", "cpu value=2i 2\n")
+	assertPendingBodies(t, queue, "second", "cpu value=1i 1\n", "cpu value=2i 2\n")
 
 	result, err = queue.enqueue([]byte("cpu value=3i 3\n"), "db=test", "")
-	if !errors.Is(err, ErrBufferFull) {
-		t.Fatalf("所有队列都满时应返回 ErrBufferFull，实际为 %v", err)
+	if err != nil {
+		t.Fatalf("第三次入队失败: %v", err)
 	}
-	if len(result.accepted) != 0 || len(result.full) != 2 {
-		t.Fatalf("所有队列已满的结果错误: %#v", result)
+	if len(result.evicted) != 2 || result.evicted[0].name != "first" || result.evicted[1].name != "second" {
+		t.Fatalf("第三次写入的淘汰结果错误: %#v", result.evicted)
 	}
+	assertPendingBodies(t, queue, "first", "cpu value=3i 3\n")
+	assertPendingBodies(t, queue, "second", "cpu value=2i 2\n", "cpu value=3i 3\n")
 
 	close(release)
 	if err := queue.Close(); err != nil {
@@ -212,10 +213,11 @@ func TestResponseFailureIncludesBackendBody(t *testing.T) {
 	}
 }
 
-func TestDurableHTTPAcknowledgesWhenAtLeastOneOutputAccepts(t *testing.T) {
+func TestDurableHTTPWritesLatestRecordToAllOutputs(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{}, 1)
-	fullPoster := &controlledPoster{status: http.StatusNoContent}
+	fullStarted := make(chan struct{}, 1)
+	fullPoster := &controlledPoster{started: fullStarted, status: http.StatusNoContent}
 	full := testBackend("full", fullPoster, 1)
 	slow := testBackend("slow", &controlledPoster{
 		started: started,
@@ -238,15 +240,12 @@ func TestDurableHTTPAcknowledgesWhenAtLeastOneOutputAccepts(t *testing.T) {
 	relay.ServeHTTP(response, request)
 
 	if response.Code != http.StatusNoContent {
-		t.Fatalf("至少一个 output 入队后应返回 204，实际为 %d: %s", response.Code, response.Body.String())
+		t.Fatalf("全部 output 写入最新记录后应返回 204，实际为 %d: %s", response.Code, response.Body.String())
 	}
 	waitSignal(t, started, "WAL 提交后 worker 没有开始异步投递")
-	if calls := atomic.LoadInt32(&fullPoster.calls); calls != 0 {
-		t.Fatalf("已满 output 不应收到投递，实际调用 %d 次", calls)
-	}
-	fullActive, _ := queueBytes(t, queue, "full")
-	if fullActive != 0 {
-		t.Fatalf("已满 output 不应新增记录，active=%d", fullActive)
+	waitSignal(t, fullStarted, "容量不足的 output 没有收到最新记录")
+	if calls := atomic.LoadInt32(&fullPoster.calls); calls != 1 {
+		t.Fatalf("容量不足的 output 应收到最新记录，实际调用 %d 次", calls)
 	}
 	active, _ := queueBytes(t, queue, "slow")
 	if active == 0 {
@@ -259,8 +258,10 @@ func TestDurableHTTPAcknowledgesWhenAtLeastOneOutputAccepts(t *testing.T) {
 	}
 }
 
-func TestDurableHTTPReturns503OnlyWhenAllOutputsAreFull(t *testing.T) {
-	poster := &controlledPoster{status: http.StatusNoContent}
+func TestDurableHTTPKeepsLatestRecordLargerThanQueueLimit(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	poster := &controlledPoster{started: started, release: release, status: http.StatusNoContent}
 	backend := testBackend("full", poster, 1)
 	queue, cleanup := openTestQueue(t, backend)
 	defer cleanup()
@@ -276,18 +277,15 @@ func TestDurableHTTPReturns503OnlyWhenAllOutputsAreFull(t *testing.T) {
 	response := httptest.NewRecorder()
 	relay.ServeHTTP(response, request)
 
-	if response.Code != http.StatusServiceUnavailable {
-		t.Fatalf("所有 output 都满时应返回 503，实际为 %d", response.Code)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("单条记录超过队列上限时仍应保留最新记录并返回 204，实际为 %d", response.Code)
 	}
-	if response.Header().Get("Retry-After") != "1" {
-		t.Fatalf("所有 output 都满时缺少 Retry-After: %q", response.Header().Get("Retry-After"))
+	waitSignal(t, started, "超过队列上限的最新记录没有开始投递")
+	active, _ := queueBytes(t, queue, "full")
+	if active <= backend.maxBuffered {
+		t.Fatalf("单条超限记录未按软上限保留: active=%d limit=%d", active, backend.maxBuffered)
 	}
-	if !strings.Contains(response.Body.String(), "所有 output") {
-		t.Fatalf("错误信息没有说明所有 output 均已满: %s", response.Body.String())
-	}
-	if calls := atomic.LoadInt32(&poster.calls); calls != 0 {
-		t.Fatalf("已满 output 不应收到投递，实际调用 %d 次", calls)
-	}
+	close(release)
 }
 
 func testBackend(name string, p poster, limit int64) *httpBackend {
@@ -331,6 +329,33 @@ func queueBytes(t *testing.T, queue *durableQueue, name string) (int64, int64) {
 		t.Fatal(err)
 	}
 	return active, dead
+}
+
+func assertPendingBodies(t *testing.T, queue *durableQueue, name string, expected ...string) {
+	t.Helper()
+	var actual []string
+	if err := queue.db.View(func(tx *bolt.Tx) error {
+		pending := tx.Bucket(queueRootBucket).Bucket([]byte(name)).Bucket(pendingBucket)
+		cursor := pending.Cursor()
+		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+			record, err := decodeRecord(value)
+			if err != nil {
+				return err
+			}
+			actual = append(actual, string(record.body))
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(actual) != len(expected) {
+		t.Fatalf("output %q 的待投递记录数为 %d，期望 %d: %#v", name, len(actual), len(expected), actual)
+	}
+	for i := range expected {
+		if actual[i] != expected[i] {
+			t.Fatalf("output %q 的第 %d 条记录为 %q，期望 %q", name, i, actual[i], expected[i])
+		}
+	}
 }
 
 func waitSignal(t *testing.T, signal <-chan struct{}, message string) {

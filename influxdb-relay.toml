@@ -9,15 +9,15 @@ bind-addr = "0.0.0.0:5888"
 queue-path = "/var/lib/influxdb-relay/hk01.queue.db"
 
 # 持久化模式要求列表中每个 output 的 buffer-size-mb 都为正数。
-# 入队会在一个 BoltDB 事务中写入所有尚有空间的 output。
-# 至少一个 output 入队成功就返回 204；只有全部 output 都没有空间时才返回 503。
-# 已满 output 会静默跳过本次数据，跳过的数据不会自动补发。
+# 入队会在一个 BoltDB 事务中写入所有 output。
+# 空间不足时静默淘汰最老的待投递数据，再保留最新数据；事务提交后返回 204。
+# 被淘汰的数据不会自动补发。
 #
 # output 字段含义：
 #   name：output 唯一名称，也是持久化 bucket 标识；存在积压时不要修改。
 #   location：完整的远端 /write URL。
 #   timeout：每次远端请求的超时，默认 10s。它不阻塞其他 output 或客户端 ACK。
-#   buffer-size-mb：该 output 活动队列的逻辑容量上限。
+#   buffer-size-mb：该 output 活动队列的逻辑目标容量；空间不足时淘汰最老记录。
 #                   dead-letter 另有同等上限，因此磁盘至少按所有该值之和的 2 倍规划。
 #   max-batch-kb：worker 按相同查询参数和认证信息合并正文的上限，默认 512KB。
 #   max-delay-interval：可重试错误的指数退避上限，默认 10s；实际等待包含随机抖动。

@@ -112,7 +112,7 @@ The setup should look like this:
 
 The relay will listen for HTTP or UDP writes and write the data to each InfluxDB server via the HTTP write or UDP endpoint, as appropriate.
 
-HTTP 推荐启用持久化队列。启用后，一次请求会在一个本地事务中写入所有尚有空间的 output 独立队列；至少一个 output 入队成功后 relay 返回 204，各 output worker 再异步投递。某个远端 output 故障或队列满不会阻塞其他 output，也不会让请求 goroutine 等待远端恢复。未配置持久化队列时仍保留旧的同步转发行为，仅用于兼容旧配置。
+HTTP 推荐启用持久化队列。启用后，一次请求会在一个本地事务中写入所有 output 的独立队列；空间不足的 output 会先淘汰最老的待投递记录，再保留最新记录。事务提交后 relay 返回 204，各 output worker 再异步投递。某个远端 output 故障不会阻塞其他 output，也不会让请求 goroutine 等待远端恢复。未配置持久化队列时仍保留旧的同步转发行为，仅用于兼容旧配置。
 
 With this setup a failure of one Relay or one InfluxDB can be sustained while still taking writes and serving queries. However, the recovery process might require operator intervention.
 
@@ -123,24 +123,24 @@ With this setup a failure of one Relay or one InfluxDB can be sustained while st
 配置项：
 
 * `queue-path`：该 HTTP relay 的 BoltDB 队列文件。默认位于 `/var/lib/influxdb-relay`。
-* `buffer-size-mb`：单个 output 活动队列的逻辑容量上限。
+* `buffer-size-mb`：单个 output 活动队列的逻辑目标容量。空间不足时从队首淘汰最老记录。
 * `max-batch-kb`：worker 一次合并投递的最大请求体，默认 512KB。
 * `max-delay-interval`：指数退避上限，默认 10 秒；实际等待会加入随机抖动。
 * `timeout`：单次远端 HTTP 请求超时，默认 10 秒。
 
-通过解析和校验的请求在持久化阶段按以下规则响应：
+通过解析和校验的请求在持久化阶段按以下规则处理：
 
-1. 至少一个 output 成功入队时返回 204。已满 output 会静默跳过本次记录，避免队列容量日志淹没真正的 HTTP 错误。
-2. 所有 output 都满时返回 503 和 `Retry-After: 1`。
-3. WAL 事务提交失败时，所有本次入队写入都会回滚并返回 503。
+1. 每个 output 空间不足时，静默删除最老的待投递记录，直到可以写入最新记录。
+2. 最新记录在一个事务中进入全部 output 后返回 204。
+3. WAL 事务提交失败时，所有本次淘汰和入队操作都会回滚并返回 503。
 
-跳过满队列可以保证正常 output 持续接收，但满队列 output 会永久缺失这部分数据。如果业务要求每个 output 一条不漏，应通过外部磁盘和队列监控提前扩容，而不能只依赖客户端 204 或 relay 日志。
+如果单条最新记录本身超过 `buffer-size-mb`，该 output 会清空旧的待投递记录，并把这条记录作为唯一记录保留；因此该配置是滚动队列的目标容量，不是单条记录的硬限制。故障持续过久时会永久丢失最老数据。如果业务要求每条数据都保留，应通过外部磁盘和队列监控提前扩容，而不能只依赖客户端 204 或 relay 日志。
 
 每个 output 严格从自己的 FIFO 队列头部消费。网络错误、408、425、429 和 5xx 使用指数退避重试；其他响应进入该 output 的 dead-letter，避免错误数据永久堵住队首。dead-letter 的逻辑容量也以该 output 的 `buffer-size-mb` 为上限，超过后淘汰最旧记录并记录日志。
 
 对于已经入队的 output，投递保证是 **at-least-once**：relay 在远端写成功之后、删除 WAL 记录之前崩溃时，重启后会重放该记录。规范化后的点包含固定时间戳，因此重放相同 series/timestamp 通常由 InfluxDB 按覆盖写处理，但业务仍不应假设 exactly-once。
 
-容量规划至少应预留 `2 × 所有 output 的 buffer-size-mb 之和`，再加 BoltDB 页和文件系统开销。BoltDB 会复用已释放页面，但队列清空后文件大小不会立即缩小。队列文件以 `0600` 创建，其中包含请求正文、查询参数和 Authorization header；请限制目录权限并纳入磁盘监控。output 的 `name` 是持久化 bucket 标识，存在积压时不要随意改名。
+容量规划至少应预留 `2 × 所有 output 的 buffer-size-mb 之和`，再加最大单条请求、BoltDB 页和文件系统开销。BoltDB 会复用已释放页面，但队列清空后文件大小不会立即缩小。队列文件以 `0600` 创建，其中包含请求正文、查询参数和 Authorization header；请限制目录权限并纳入磁盘监控。output 的 `name` 是持久化 bucket 标识，存在积压时不要随意改名。
 
 ## Recovery
 
