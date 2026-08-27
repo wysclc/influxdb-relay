@@ -9,7 +9,7 @@ After=network.target
 User=influxdb-relay
 Group=influxdb-relay
 LimitNOFILE=65536
-ExecStart=/usr/bin/influxdb-relay -config /etc/influxdb-relay/influxdb-relay.conf
+ExecStart=/usr/local/bin/influxdb-relay -config /etc/influxdb-relay/influxdb-relay.toml
 KillMode=control-group
 Restart=on-failure
 
