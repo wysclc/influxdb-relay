@@ -13,7 +13,7 @@ bind-addr = "0.0.0.0:9096"
 # Kapacitor 通常需要正确的数据库和保留策略才能把数据交给对应任务。
 default-retention-policy = "autogen"
 
-# queue-path：三个 output 共用的本地 WAL；内部按 output 名称使用独立 FIFO bucket。
+# queue-path：三个 output 共用的本地 WAL；内部按 output 名称使用独立 LIFO 队列。
 queue-path = "/var/lib/influxdb-relay/kapacitor-http.queue.db"
 
 # 所有 output 都必须启用正数 buffer-size-mb，才能使用一致的持久化 ACK 语义。
@@ -25,6 +25,6 @@ output = [
     { name="kapacitor1", location="http://kapacitor1:9092/write", timeout="10s", buffer-size-mb=100, max-batch-kb=512, max-delay-interval="5s" },
 ]
 
-# 单个 output 故障时，另外两个 worker 继续投递；故障 output 恢复后按 FIFO 补发积压。
+# 单个 output 故障时，另外两个 worker 继续投递；故障 output 恢复后从最新积压开始补发。
 # 如果某个队列空间不足，会淘汰最老的待投递数据，并把最新数据写入该 output。
 # 三个 100MB 活动队列加三个最多 100MB dead-letter，磁盘至少预留约 600MB 加数据库开销。

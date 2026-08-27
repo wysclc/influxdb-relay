@@ -54,7 +54,7 @@ type evictedOutput struct {
 }
 
 // durableQueue 在一个 BoltDB 事务中把最新请求写入所有 output。
-// 空间不足时淘汰最老的待投递记录，每个 output 始终保留最新数据。
+// worker 从最新记录开始投递；空间不足时淘汰最老记录，每个 output 优先保留新数据。
 type durableQueue struct {
 	db       *bolt.DB
 	path     string
@@ -312,7 +312,8 @@ func (q *durableQueue) peekBatch(backend *httpBackend, batchLimit int) (durableB
 		output := tx.Bucket(queueRootBucket).Bucket([]byte(backend.name))
 		cursor := output.Bucket(pendingBucket).Cursor()
 
-		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+		// 从最大序号向前取批，实现每个 output 独立的后进先出。
+		for key, value := cursor.Last(); key != nil; key, value = cursor.Prev() {
 			record, err := decodeRecord(value)
 			if err != nil {
 				return fmt.Errorf("记录 %x 损坏: %v", key, err)

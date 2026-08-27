@@ -134,6 +134,43 @@ func TestDurableQueueEvictsOldestRecordsPerOutput(t *testing.T) {
 	}
 }
 
+func TestDurableQueuePeeksNewestRecordsFirst(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	backend := testBackend("latest-first", &controlledPoster{
+		started: started,
+		release: release,
+		status:  http.StatusNoContent,
+	}, 1<<20)
+	queue, cleanup := openTestQueue(t, backend)
+	defer cleanup()
+
+	if _, err := queue.enqueue([]byte("cpu value=1i 1\n"), "db=test", ""); err != nil {
+		t.Fatal(err)
+	}
+	waitSignal(t, started, "worker 没有开始首次投递")
+	if _, err := queue.enqueue([]byte("cpu value=2i 2\n"), "db=test", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.enqueue([]byte("cpu value=3i 3\n"), "db=test", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	batch, found, err := queue.peekBatch(backend, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("队列中没有找到待投递记录")
+	}
+	want := "cpu value=3i 3\ncpu value=2i 2\ncpu value=1i 1\n"
+	if got := string(batch.body); got != want {
+		t.Fatalf("后进先出批次顺序错误：\n实际 %q\n期望 %q", got, want)
+	}
+
+	close(release)
+}
+
 func TestDurableQueueRecoversPendingRecordsAfterRestart(t *testing.T) {
 	tempDir, err := ioutil.TempDir("", "influxdb-relay-test-")
 	if err != nil {

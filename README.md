@@ -140,7 +140,9 @@ With this setup a failure of one Relay or one InfluxDB can be sustained while st
 
 如果单条最新记录本身超过 `buffer-size-mb`，该 output 会清空旧的待投递记录，并把这条记录作为唯一记录保留；因此该配置是滚动队列的目标容量，不是单条记录的硬限制。故障持续过久时会永久丢失最老数据。如果业务要求每条数据都保留，应通过外部磁盘和队列监控提前扩容，而不能只依赖客户端 204 或 relay 日志。
 
-每个 output 严格从自己的 FIFO 队列头部消费。网络错误、408、425、429 和 5xx 使用指数退避重试；其他响应进入该 output 的 dead-letter，避免错误数据永久堵住队首。dead-letter 的逻辑容量也以该 output 的 `buffer-size-mb` 为上限，超过后淘汰最旧记录并记录日志。
+每个 output 按 LIFO 从自己的最新记录开始消费。网络错误、408、425、429 和 5xx 使用指数退避重试；重试期间如果有更新记录到达，恢复后仍优先投递最新记录。其他响应进入该 output 的 dead-letter，避免错误数据永久阻塞投递。dead-letter 的逻辑容量也以该 output 的 `buffer-size-mb` 为上限，超过后淘汰最旧记录并记录日志。
+
+LIFO 优先保证远端尽快看到最新数据，但持续写入时旧记录可能长期得不到投递，最终在队列满时被淘汰。对于相同 series/timestamp，旧记录稍后投递还可能覆盖已经写入的新值；依赖写入顺序解决字段冲突或要求严格时序的业务不应使用这种语义。
 
 启用 `adaptive-batch` 后，worker 使用平滑后的端到端吞吐量估算下一批大小。慢速成功会逐步缩小批量，可重试错误会立即把批量减半，成功恢复时每次最多增长 25%，并始终限制在 `min-batch-kb` 与 `max-batch-kb` 之间。小于下限的零散请求不会参与估算。该上限只限制多条队列记录的合并：为了保持原始请求的完整投递和重试语义，单条记录不会拆分，因此可能大于当前批量上限。
 
@@ -176,7 +178,7 @@ While `influxdb-relay` does provide some level of high availability, there are a
 
 - `influxdb-relay` will not relay the `/query` endpoint, and this includes schema modification (create database, `DROP`s, etc). This means that databases must be created before points are written to the backends.
 - Continuous queries will still only write their results locally. If a server goes down, the continuous query will have to be backfilled after the data has been recovered for that instance.
-- 每个 output 内部保持 FIFO，但故障 output 清空积压前仍落后于正常 output。查询负载均衡器应在该 output 追平前将其摘除，避免读到不完整数据。
+- 每个 output 优先投递最新数据，但故障 output 清空积压前仍可能缺少历史点。查询负载均衡器应在该 output 追平前将其摘除，避免读到不完整数据。
 - WAL 提供 at-least-once 而不是 exactly-once。重放相同 series/timestamp 时可能覆盖字段，因此应避免依赖写入次数产生业务副作用。
 
 ## Building
