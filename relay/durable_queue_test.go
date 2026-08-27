@@ -61,7 +61,7 @@ func TestDurableQueueIsolatesFailedOutput(t *testing.T) {
 
 	queue, cleanup := openTestQueue(t, bad, good)
 	defer cleanup()
-	if err := queue.enqueue([]byte("cpu value=1i 1\n"), "db=test", ""); err != nil {
+	if _, err := queue.enqueue([]byte("cpu value=1i 1\n"), "db=test", ""); err != nil {
 		t.Fatalf("入队失败: %v", err)
 	}
 
@@ -83,7 +83,7 @@ func TestDurableQueueIsolatesFailedOutput(t *testing.T) {
 	}
 }
 
-func TestDurableQueueEnqueueIsAtomicWhenOneOutputIsFull(t *testing.T) {
+func TestDurableQueueSkipsOnlyFullOutput(t *testing.T) {
 	payload, err := encodeRecord(durableRecord{query: "db=test", body: []byte("cpu value=1i 1\n")})
 	if err != nil {
 		t.Fatal(err)
@@ -93,25 +93,38 @@ func TestDurableQueueEnqueueIsAtomicWhenOneOutputIsFull(t *testing.T) {
 	firstStarted := make(chan struct{}, 1)
 	secondStarted := make(chan struct{}, 1)
 	first := testBackend("first", &controlledPoster{started: firstStarted, release: release, status: 204}, limit)
-	second := testBackend("second", &controlledPoster{started: secondStarted, release: release, status: 204}, limit)
+	second := testBackend("second", &controlledPoster{started: secondStarted, release: release, status: 204}, limit*2)
 	queue, cleanup := openTestQueue(t, first, second)
 	defer cleanup()
 
-	if err := queue.enqueue([]byte("cpu value=1i 1\n"), "db=test", ""); err != nil {
+	if _, err := queue.enqueue([]byte("cpu value=1i 1\n"), "db=test", ""); err != nil {
 		t.Fatalf("第一次入队失败: %v", err)
 	}
 	waitSignal(t, firstStarted, "first output 没有读取记录")
 	waitSignal(t, secondStarted, "second output 没有读取记录")
 
-	err = queue.enqueue([]byte("cpu value=2i 2\n"), "db=test", "")
-	if !errors.Is(err, ErrBufferFull) {
-		t.Fatalf("队列满应返回 ErrBufferFull，实际为 %v", err)
+	result, err := queue.enqueue([]byte("cpu value=2i 2\n"), "db=test", "")
+	if err != nil {
+		t.Fatalf("仍有 output 可接收时不应返回错误: %v", err)
 	}
-	for _, name := range []string{"first", "second"} {
-		active, _ := queueBytes(t, queue, name)
-		if active != limit {
-			t.Fatalf("output %q 出现部分入队，active=%d want=%d", name, active, limit)
-		}
+	if len(result.accepted) != 1 || result.accepted[0] != "second" {
+		t.Fatalf("第二次写入的接收 output 错误: %#v", result.accepted)
+	}
+	if len(result.full) != 1 || result.full[0].name != "first" {
+		t.Fatalf("第二次写入的满队列 output 错误: %#v", result.full)
+	}
+	firstActive, _ := queueBytes(t, queue, "first")
+	secondActive, _ := queueBytes(t, queue, "second")
+	if firstActive != limit || secondActive != limit*2 {
+		t.Fatalf("各 output 入队结果错误: first=%d second=%d", firstActive, secondActive)
+	}
+
+	result, err = queue.enqueue([]byte("cpu value=3i 3\n"), "db=test", "")
+	if !errors.Is(err, ErrBufferFull) {
+		t.Fatalf("所有队列都满时应返回 ErrBufferFull，实际为 %v", err)
+	}
+	if len(result.accepted) != 0 || len(result.full) != 2 {
+		t.Fatalf("所有队列已满的结果错误: %#v", result)
 	}
 
 	close(release)
@@ -138,7 +151,7 @@ func TestDurableQueueRecoversPendingRecordsAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := queue.enqueue([]byte("cpu value=1i 1\n"), "db=test", "token"); err != nil {
+	if _, err := queue.enqueue([]byte("cpu value=1i 1\n"), "db=test", "token"); err != nil {
 		t.Fatal(err)
 	}
 	waitSignal(t, started, "首次投递没有开始")
@@ -172,7 +185,7 @@ func TestDurableQueueMovesNonRetryableResponseToDeadLetter(t *testing.T) {
 	backend := testBackend("invalid", poster, 1<<20)
 	queue, cleanup := openTestQueue(t, backend)
 	defer cleanup()
-	if err := queue.enqueue([]byte("cpu value=1i 1\n"), "db=test", ""); err != nil {
+	if _, err := queue.enqueue([]byte("cpu value=1i 1\n"), "db=test", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -189,14 +202,66 @@ func TestDurableQueueMovesNonRetryableResponseToDeadLetter(t *testing.T) {
 	}
 }
 
-func TestDurableHTTPAcknowledgesAfterWALCommit(t *testing.T) {
+func TestResponseFailureIncludesBackendBody(t *testing.T) {
+	reason := responseFailure(&responseData{
+		StatusCode: http.StatusServiceUnavailable,
+		Body:       []byte(`{"error":"disk full"}`),
+	})
+	if !strings.Contains(reason, "HTTP 503") || !strings.Contains(reason, "disk full") {
+		t.Fatalf("后端错误原因不完整: %q", reason)
+	}
+}
+
+func TestDurableHTTPAcknowledgesWhenAtLeastOneOutputAccepts(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{}, 1)
-	backend := testBackend("slow", &controlledPoster{
+	fullPoster := &controlledPoster{status: http.StatusNoContent}
+	full := testBackend("full", fullPoster, 1)
+	slow := testBackend("slow", &controlledPoster{
 		started: started,
 		release: release,
 		status:  http.StatusServiceUnavailable,
 	}, 1<<20)
+	queue, cleanup := openTestQueue(t, full, slow)
+	defer cleanup()
+	relay := &HTTP{
+		name:     "durable-http",
+		schema:   "http",
+		backends: []*httpBackend{full, slow},
+		queue:    queue,
+		stopped:  make(chan struct{}),
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/write?db=test&precision=n", strings.NewReader("cpu value=1i 1"))
+	request.Header.Set("Authorization", "Token secret")
+	response := httptest.NewRecorder()
+	relay.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("至少一个 output 入队后应返回 204，实际为 %d: %s", response.Code, response.Body.String())
+	}
+	waitSignal(t, started, "WAL 提交后 worker 没有开始异步投递")
+	if calls := atomic.LoadInt32(&fullPoster.calls); calls != 0 {
+		t.Fatalf("已满 output 不应收到投递，实际调用 %d 次", calls)
+	}
+	fullActive, _ := queueBytes(t, queue, "full")
+	if fullActive != 0 {
+		t.Fatalf("已满 output 不应新增记录，active=%d", fullActive)
+	}
+	active, _ := queueBytes(t, queue, "slow")
+	if active == 0 {
+		t.Fatal("远端尚未成功时 WAL 记录被意外删除")
+	}
+
+	close(release)
+	if err := queue.Close(); err != nil {
+		t.Fatalf("关闭队列失败: %v", err)
+	}
+}
+
+func TestDurableHTTPReturns503OnlyWhenAllOutputsAreFull(t *testing.T) {
+	poster := &controlledPoster{status: http.StatusNoContent}
+	backend := testBackend("full", poster, 1)
 	queue, cleanup := openTestQueue(t, backend)
 	defer cleanup()
 	relay := &HTTP{
@@ -208,22 +273,20 @@ func TestDurableHTTPAcknowledgesAfterWALCommit(t *testing.T) {
 	}
 
 	request := httptest.NewRequest(http.MethodPost, "/write?db=test&precision=n", strings.NewReader("cpu value=1i 1"))
-	request.Header.Set("Authorization", "Token secret")
 	response := httptest.NewRecorder()
 	relay.ServeHTTP(response, request)
 
-	if response.Code != http.StatusNoContent {
-		t.Fatalf("WAL 提交后应立即返回 204，实际为 %d: %s", response.Code, response.Body.String())
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("所有 output 都满时应返回 503，实际为 %d", response.Code)
 	}
-	waitSignal(t, started, "WAL 提交后 worker 没有开始异步投递")
-	active, _ := queueBytes(t, queue, "slow")
-	if active == 0 {
-		t.Fatal("远端尚未成功时 WAL 记录被意外删除")
+	if response.Header().Get("Retry-After") != "1" {
+		t.Fatalf("所有 output 都满时缺少 Retry-After: %q", response.Header().Get("Retry-After"))
 	}
-
-	close(release)
-	if err := queue.Close(); err != nil {
-		t.Fatalf("关闭队列失败: %v", err)
+	if !strings.Contains(response.Body.String(), "所有 output") {
+		t.Fatalf("错误信息没有说明所有 output 均已满: %s", response.Body.String())
+	}
+	if calls := atomic.LoadInt32(&poster.calls); calls != 0 {
+		t.Fatalf("已满 output 不应收到投递，实际调用 %d 次", calls)
 	}
 }
 

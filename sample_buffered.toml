@@ -1,5 +1,6 @@
 # 推荐的 HTTP 持久化配置示例。
-# 客户端请求通过解析后，会在一个本地事务中原子写入全部 output 队列；提交成功返回 204。
+# 客户端请求通过解析后，会在一个本地事务中写入所有尚有空间的 output 队列。
+# 至少一个 output 入队成功就返回 204；只有全部 output 都满时才返回 503。
 # 每个 output 由独立 FIFO worker 异步投递，一个远端故障不会阻塞其他 output。
 
 [[http]]
@@ -21,7 +22,7 @@ queue-path = "/var/lib/influxdb-relay/example-http.queue.db"
 # ssl-combined-pem = "/etc/influxdb-relay/server.pem"
 
 # 持久化模式要求列表中每个 output 的 buffer-size-mb 都为正数。
-# 入队会在一个 BoltDB 事务中写入所有 output；任一队列已满时整体回滚并返回 503。
+# 入队会在一个 BoltDB 事务中写入所有有空间的 output；已满 output 跳过并记录数据缺失日志。
 #
 # output 字段含义：
 #   name：output 唯一名称，也是持久化 bucket 标识；存在积压时不要修改。
@@ -40,3 +41,4 @@ output = [
 # 重试分类：网络错误、HTTP 408、425、429 和 5xx 会指数退避重试。
 # 其他非 2xx 响应会移入该 output 的有界 dead-letter，避免错误数据永久堵住队首。
 # 投递保证为 at-least-once：远端成功后、WAL 删除前若进程崩溃，重启后可能重放。
+# 注意：已满 output 跳过的数据不会补发；如要求所有副本完整，必须监控容量并及时扩容。

@@ -43,7 +43,7 @@ type HTTPOutputConfig struct {
 	Timeout string `toml:"timeout"`
 
 	// BufferSizeMB 是该后端持久化待投递队列的容量上限。
-	// 为所有 HTTP output 配置正值后启用原子持久化和异步投递。
+	// 为所有 HTTP output 配置正值后启用独立持久化和异步投递。
 	BufferSizeMB int `toml:"buffer-size-mb"`
 
 	// Maximum batch size in KB (Default 512)

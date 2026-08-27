@@ -89,7 +89,7 @@ func NewHTTP(cfg HTTPConfig) (Relay, error) {
 		return nil, fmt.Errorf("HTTP relay %q 至少需要一个 output", h.Name())
 	}
 
-	// 为避免一次请求只持久化到部分 output，不允许混用同步和持久化模式。
+	// 为保持同一 relay 的 ACK 和投递语义一致，不允许混用同步和持久化模式。
 	if buffered != 0 && buffered != len(h.backends) {
 		return nil, fmt.Errorf("HTTP relay %q 必须为全部 output 配置 buffer-size-mb，或全部关闭", h.Name())
 	}
@@ -285,12 +285,16 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get("Authorization")
 
 	if h.queue != nil {
-		err := h.queue.enqueue(outBytes, query, authHeader)
+		result, err := h.queue.enqueue(outBytes, query, authHeader)
 		putBuf(outBuf)
+		for _, full := range result.full {
+			log.Printf("HTTP relay %q 的 output %q 持久化队列已满，跳过本次数据（active=%d, limit=%d, dropped=%d bytes, accepted_outputs=%d）",
+				h.Name(), full.name, full.activeBytes, full.limitBytes, full.droppedBytes, len(result.accepted))
+		}
 		if err != nil {
 			if errors.Is(err, ErrBufferFull) {
 				w.Header().Set("Retry-After", "1")
-				jsonError(w, http.StatusServiceUnavailable, "持久化队列已满，请稍后重试")
+				jsonError(w, http.StatusServiceUnavailable, "所有 output 的持久化队列均已满，请稍后重试")
 			} else {
 				log.Printf("HTTP relay %q 写入持久化队列失败: %v", h.Name(), err)
 				jsonError(w, http.StatusServiceUnavailable, "无法持久化写入请求")
@@ -438,18 +442,18 @@ func (b *simplePoster) post(ctx context.Context, buf []byte, query string, auth 
 		return nil, err
 	}
 
-	data, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	data, readErr := ioutil.ReadAll(resp.Body)
+	closeErr := resp.Body.Close()
+	if readErr != nil {
+		return nil, readErr
 	}
-
-	if err = resp.Body.Close(); err != nil {
-		return nil, err
+	if closeErr != nil {
+		return nil, closeErr
 	}
 
 	return &responseData{
-		ContentType:     resp.Header.Get("Conent-Type"),
-		ContentEncoding: resp.Header.Get("Conent-Encoding"),
+		ContentType:     resp.Header.Get("Content-Type"),
+		ContentEncoding: resp.Header.Get("Content-Encoding"),
 		StatusCode:      resp.StatusCode,
 		Body:            data,
 	}, nil

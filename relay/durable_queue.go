@@ -29,7 +29,7 @@ var (
 	activeBytesKey  = []byte("active-bytes")
 	deadBytesKey    = []byte("dead-bytes")
 
-	// ErrBufferFull 表示至少一个 output 的持久化队列已经达到配置上限。
+	// ErrBufferFull 表示所有 output 的持久化队列都已经达到配置上限。
 	ErrBufferFull = errors.New("durable queue full")
 )
 
@@ -46,8 +46,20 @@ type durableBatch struct {
 	body  []byte
 }
 
-// durableQueue 在一个 BoltDB 事务中把请求写入所有 output，确保不会部分入队。
-// 每个 output 使用独立 bucket 和 worker，远端故障不会阻塞其他 output。
+type fullOutput struct {
+	name         string
+	activeBytes  int64
+	limitBytes   int64
+	droppedBytes int64
+}
+
+type enqueueResult struct {
+	accepted []string
+	full     []fullOutput
+}
+
+// durableQueue 在一个 BoltDB 事务中把请求写入所有尚有空间的 output。
+// 每个 output 使用独立 bucket 和 worker，队列满或远端故障不会阻塞其他 output。
 type durableQueue struct {
 	db       *bolt.DB
 	path     string
@@ -114,6 +126,8 @@ func newDurableQueue(path string, backends []*httpBackend) (*durableQueue, error
 
 	for _, backend := range backends {
 		q.wakes[backend.name] = make(chan struct{}, 1)
+	}
+	for _, backend := range backends {
 		q.wg.Add(1)
 		go q.runBackend(backend)
 	}
@@ -121,26 +135,36 @@ func newDurableQueue(path string, backends []*httpBackend) (*durableQueue, error
 	return q, nil
 }
 
-func (q *durableQueue) enqueue(body []byte, query, auth string) error {
+func (q *durableQueue) enqueue(body []byte, query, auth string) (enqueueResult, error) {
+	var result enqueueResult
+	var acceptedBackends []*httpBackend
 	payload, err := encodeRecord(durableRecord{query: query, auth: auth, body: body})
 	if err != nil {
-		return err
+		return result, err
 	}
 	recordBytes := int64(8 + len(payload))
 
 	err = q.db.Update(func(tx *bolt.Tx) error {
 		root := tx.Bucket(queueRootBucket)
 
-		// 先检查全部 output，再统一写入；事务失败时不会留下部分副本。
+		// 队列满的 output 跳过本次记录，其他 output 继续在同一事务中入队。
 		for _, backend := range q.backends {
 			output := root.Bucket([]byte(backend.name))
 			active := readCounter(output.Bucket(metaBucket), activeBytesKey)
 			if active+recordBytes > backend.maxBuffered {
-				return fmt.Errorf("%w: output %q", ErrBufferFull, backend.name)
+				result.full = append(result.full, fullOutput{
+					name:         backend.name,
+					activeBytes:  active,
+					limitBytes:   backend.maxBuffered,
+					droppedBytes: recordBytes,
+				})
+				continue
 			}
+			result.accepted = append(result.accepted, backend.name)
+			acceptedBackends = append(acceptedBackends, backend)
 		}
 
-		for _, backend := range q.backends {
+		for _, backend := range acceptedBackends {
 			output := root.Bucket([]byte(backend.name))
 			pending := output.Bucket(pendingBucket)
 			sequence, err := pending.NextSequence()
@@ -158,13 +182,16 @@ func (q *durableQueue) enqueue(body []byte, query, auth string) error {
 		return nil
 	})
 	if err != nil {
-		return err
+		return enqueueResult{}, err
+	}
+	if len(result.accepted) == 0 {
+		return result, fmt.Errorf("%w: all %d outputs", ErrBufferFull, len(result.full))
 	}
 
-	for _, backend := range q.backends {
-		q.wake(backend.name)
+	for _, name := range result.accepted {
+		q.wake(name)
 	}
-	return nil
+	return result, nil
 }
 
 func (q *durableQueue) runBackend(backend *httpBackend) {
@@ -205,6 +232,13 @@ func (q *durableQueue) runBackend(backend *httpBackend) {
 		}
 
 		resp, postErr := backend.poster.post(q.ctx, batch.body, batch.query, batch.auth)
+		if postErr != nil {
+			select {
+			case <-q.stop:
+				return
+			default:
+			}
+		}
 		if postErr == nil && resp != nil && resp.StatusCode/100 == 2 {
 			if err := q.ack(backend, batch.ids); err != nil {
 				log.Printf("确认 output %q 的持久化记录失败，将安全重放: %v", backend.name, err)
@@ -245,9 +279,9 @@ func (q *durableQueue) runBackend(backend *httpBackend) {
 		}
 
 		if postErr != nil {
-			log.Printf("投递 output %q 失败，将重试: %v", backend.name, postErr)
+			log.Printf("投递 output %q 失败，将重试（records=%d, bytes=%d）: %v", backend.name, len(batch.ids), len(batch.body), postErr)
 		} else if resp != nil {
-			log.Printf("投递 output %q 收到 %d，将重试", backend.name, resp.StatusCode)
+			log.Printf("投递 output %q 收到可重试响应，将重试（records=%d, bytes=%d）: %s", backend.name, len(batch.ids), len(batch.body), responseFailure(resp))
 		} else {
 			log.Printf("投递 output %q 未收到有效响应，将重试", backend.name)
 		}

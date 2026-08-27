@@ -16,7 +16,7 @@ default-retention-policy = "autogen"
 # queue-path：三个 output 共用的本地 WAL；内部按 output 名称使用独立 FIFO bucket。
 queue-path = "/var/lib/influxdb-relay/kapacitor-http.queue.db"
 
-# 所有 output 都必须启用正数 buffer-size-mb，才能保证一次事务原子写入全部队列。
+# 所有 output 都必须启用正数 buffer-size-mb，才能使用一致的持久化 ACK 语义。
 # name 必须唯一且应保持稳定；location 必须包含各服务的 /write 路径。
 # timeout 是单次远端请求超时；max-batch-kb 是批量正文上限；max-delay-interval 是退避上限。
 output = [
@@ -26,4 +26,5 @@ output = [
 ]
 
 # 单个 output 故障时，另外两个 worker 继续投递；故障 output 恢复后按 FIFO 补发积压。
+# 如果某个队列已满，新数据会跳过该 output；只要其他 output 入队成功，客户端仍收到 204。
 # 三个 100MB 活动队列加三个最多 100MB dead-letter，磁盘至少预留约 600MB 加数据库开销。
