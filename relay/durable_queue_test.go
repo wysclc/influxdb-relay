@@ -3,8 +3,10 @@ package relay
 import (
 	"context"
 	"errors"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -57,7 +59,8 @@ func TestDurableQueueIsolatesFailedOutput(t *testing.T) {
 		status:  204,
 	}, 1<<20)
 
-	queue := openTestQueue(t, bad, good)
+	queue, cleanup := openTestQueue(t, bad, good)
+	defer cleanup()
 	if err := queue.enqueue([]byte("cpu value=1i 1\n"), "db=test", ""); err != nil {
 		t.Fatalf("入队失败: %v", err)
 	}
@@ -91,7 +94,8 @@ func TestDurableQueueEnqueueIsAtomicWhenOneOutputIsFull(t *testing.T) {
 	secondStarted := make(chan struct{}, 1)
 	first := testBackend("first", &controlledPoster{started: firstStarted, release: release, status: 204}, limit)
 	second := testBackend("second", &controlledPoster{started: secondStarted, release: release, status: 204}, limit)
-	queue := openTestQueue(t, first, second)
+	queue, cleanup := openTestQueue(t, first, second)
+	defer cleanup()
 
 	if err := queue.enqueue([]byte("cpu value=1i 1\n"), "db=test", ""); err != nil {
 		t.Fatalf("第一次入队失败: %v", err)
@@ -117,7 +121,12 @@ func TestDurableQueueEnqueueIsAtomicWhenOneOutputIsFull(t *testing.T) {
 }
 
 func TestDurableQueueRecoversPendingRecordsAfterRestart(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "restart.db")
+	tempDir, err := ioutil.TempDir("", "influxdb-relay-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+	path := filepath.Join(tempDir, "restart.db")
 	release := make(chan struct{})
 	started := make(chan struct{}, 1)
 	failing := testBackend("output", &controlledPoster{
@@ -161,7 +170,8 @@ func TestDurableQueueRecoversPendingRecordsAfterRestart(t *testing.T) {
 func TestDurableQueueMovesNonRetryableResponseToDeadLetter(t *testing.T) {
 	poster := &controlledPoster{status: 400}
 	backend := testBackend("invalid", poster, 1<<20)
-	queue := openTestQueue(t, backend)
+	queue, cleanup := openTestQueue(t, backend)
+	defer cleanup()
 	if err := queue.enqueue([]byte("cpu value=1i 1\n"), "db=test", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +197,8 @@ func TestDurableHTTPAcknowledgesAfterWALCommit(t *testing.T) {
 		release: release,
 		status:  http.StatusServiceUnavailable,
 	}, 1<<20)
-	queue := openTestQueue(t, backend)
+	queue, cleanup := openTestQueue(t, backend)
+	defer cleanup()
 	relay := &HTTP{
 		name:     "durable-http",
 		schema:   "http",
@@ -226,13 +237,22 @@ func testBackend(name string, p poster, limit int64) *httpBackend {
 	}
 }
 
-func openTestQueue(t *testing.T, backends ...*httpBackend) *durableQueue {
+func openTestQueue(t *testing.T, backends ...*httpBackend) (*durableQueue, func()) {
 	t.Helper()
-	queue, err := newDurableQueue(filepath.Join(t.TempDir(), "queue.db"), backends)
+	tempDir, err := ioutil.TempDir("", "influxdb-relay-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return queue
+	queue, err := newDurableQueue(filepath.Join(tempDir, "queue.db"), backends)
+	if err != nil {
+		_ = os.RemoveAll(tempDir)
+		t.Fatal(err)
+	}
+	cleanup := func() {
+		_ = queue.Close()
+		_ = os.RemoveAll(tempDir)
+	}
+	return queue, cleanup
 }
 
 func queueBytes(t *testing.T, queue *durableQueue, name string) (int64, int64) {
