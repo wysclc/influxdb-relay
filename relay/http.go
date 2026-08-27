@@ -3,6 +3,8 @@ package relay
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,14 +33,21 @@ type HTTP struct {
 
 	closing int64
 	l       net.Listener
+	server  *http.Server
+	mu      sync.Mutex
+	stop    sync.Once
+	stopped chan struct{}
 
 	backends []*httpBackend
+	queue    *durableQueue
 }
 
 const (
 	DefaultHTTPTimeout      = 10 * time.Second
 	DefaultMaxDelayInterval = 10 * time.Second
 	DefaultBatchSizeKB      = 512
+	DefaultQueueDir         = "/var/lib/influxdb-relay"
+	DefaultShutdownTimeout  = 30 * time.Second
 
 	KB = 1024
 	MB = 1024 * KB
@@ -45,6 +55,7 @@ const (
 
 func NewHTTP(cfg HTTPConfig) (Relay, error) {
 	h := new(HTTP)
+	h.stopped = make(chan struct{})
 
 	h.addr = cfg.Addr
 	h.name = cfg.Name
@@ -57,13 +68,42 @@ func NewHTTP(cfg HTTPConfig) (Relay, error) {
 		h.schema = "https"
 	}
 
+	buffered := 0
+	backendNames := make(map[string]struct{}, len(cfg.Outputs))
 	for i := range cfg.Outputs {
 		backend, err := newHTTPBackend(&cfg.Outputs[i])
 		if err != nil {
 			return nil, err
 		}
+		if _, exists := backendNames[backend.name]; exists {
+			return nil, fmt.Errorf("HTTP relay %q 存在重复的 output 名称 %q", h.Name(), backend.name)
+		}
+		backendNames[backend.name] = struct{}{}
+		if backend.maxBuffered > 0 {
+			buffered++
+		}
 
 		h.backends = append(h.backends, backend)
+	}
+	if len(h.backends) == 0 {
+		return nil, fmt.Errorf("HTTP relay %q 至少需要一个 output", h.Name())
+	}
+
+	// 为避免一次请求只持久化到部分 output，不允许混用同步和持久化模式。
+	if buffered != 0 && buffered != len(h.backends) {
+		return nil, fmt.Errorf("HTTP relay %q 必须为全部 output 配置 buffer-size-mb，或全部关闭", h.Name())
+	}
+	if buffered == len(h.backends) {
+		queuePath := cfg.QueuePath
+		if queuePath == "" {
+			queuePath = defaultQueuePath(h.Name())
+		}
+		queue, err := newDurableQueue(queuePath, h.backends)
+		if err != nil {
+			return nil, err
+		}
+		h.queue = queue
+		log.Printf("HTTP relay %q 使用持久化队列 %q", h.Name(), queuePath)
 	}
 
 	return h, nil
@@ -79,6 +119,7 @@ func (h *HTTP) Name() string {
 func (h *HTTP) Run() error {
 	l, err := net.Listen("tcp", h.addr)
 	if err != nil {
+		h.finish()
 		return err
 	}
 
@@ -86,6 +127,8 @@ func (h *HTTP) Run() error {
 	if h.cert != "" {
 		cert, err := tls.LoadX509KeyPair(h.cert, h.cert)
 		if err != nil {
+			_ = l.Close()
+			h.finish()
 			return err
 		}
 
@@ -94,20 +137,61 @@ func (h *HTTP) Run() error {
 		})
 	}
 
+	h.mu.Lock()
 	h.l = l
+	h.server = &http.Server{Handler: h}
+	server := h.server
+	h.mu.Unlock()
 
 	log.Printf("Starting %s relay %q on %v", strings.ToUpper(h.schema), h.Name(), h.addr)
 
-	err = http.Serve(l, h)
+	err = server.Serve(l)
 	if atomic.LoadInt64(&h.closing) != 0 {
+		<-h.stopped
 		return nil
 	}
+	h.finish()
 	return err
 }
 
 func (h *HTTP) Stop() error {
 	atomic.StoreInt64(&h.closing, 1)
-	return h.l.Close()
+
+	var stopErr error
+	h.stop.Do(func() {
+		h.mu.Lock()
+		server := h.server
+		listener := h.l
+		h.mu.Unlock()
+
+		if server != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), DefaultShutdownTimeout)
+			stopErr = server.Shutdown(ctx)
+			cancel()
+			if stopErr != nil {
+				_ = server.Close()
+			}
+		} else if listener != nil {
+			stopErr = listener.Close()
+		}
+
+		if h.queue != nil {
+			if err := h.queue.Close(); stopErr == nil {
+				stopErr = err
+			}
+		}
+		close(h.stopped)
+	})
+	return stopErr
+}
+
+func (h *HTTP) finish() {
+	h.stop.Do(func() {
+		if h.queue != nil {
+			_ = h.queue.Close()
+		}
+		close(h.stopped)
+	})
 }
 
 func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -200,6 +284,23 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// check for authorization performed via the header
 	authHeader := r.Header.Get("Authorization")
 
+	if h.queue != nil {
+		err := h.queue.enqueue(outBytes, query, authHeader)
+		putBuf(outBuf)
+		if err != nil {
+			if errors.Is(err, ErrBufferFull) {
+				w.Header().Set("Retry-After", "1")
+				jsonError(w, http.StatusServiceUnavailable, "持久化队列已满，请稍后重试")
+			} else {
+				log.Printf("HTTP relay %q 写入持久化队列失败: %v", h.Name(), err)
+				jsonError(w, http.StatusServiceUnavailable, "无法持久化写入请求")
+			}
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(len(h.backends))
 
@@ -209,7 +310,7 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b := b
 		go func() {
 			defer wg.Done()
-			resp, err := b.post(outBytes, query, authHeader)
+			resp, err := b.post(r.Context(), outBytes, query, authHeader)
 			if err != nil {
 				log.Printf("Problem posting to relay %q backend %q: %v", h.Name(), b.name, err)
 			} else {
@@ -293,7 +394,7 @@ func jsonError(w http.ResponseWriter, code int, message string) {
 }
 
 type poster interface {
-	post([]byte, string, string) (*responseData, error)
+	post(context.Context, []byte, string, string) (*responseData, error)
 }
 
 type simplePoster struct {
@@ -319,8 +420,8 @@ func newSimplePoster(location string, timeout time.Duration, skipTLSVerification
 	}
 }
 
-func (b *simplePoster) post(buf []byte, query string, auth string) (*responseData, error) {
-	req, err := http.NewRequest("POST", b.location, bytes.NewReader(buf))
+func (b *simplePoster) post(ctx context.Context, buf []byte, query string, auth string) (*responseData, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", b.location, bytes.NewReader(buf))
 	if err != nil {
 		return nil, err
 	}
@@ -356,7 +457,10 @@ func (b *simplePoster) post(buf []byte, query string, auth string) (*responseDat
 
 type httpBackend struct {
 	poster
-	name string
+	name        string
+	maxBuffered int64
+	maxBatch    int
+	maxDelay    time.Duration
 }
 
 func newHTTPBackend(cfg *HTTPOutputConfig) (*httpBackend, error) {
@@ -373,35 +477,50 @@ func newHTTPBackend(cfg *HTTPOutputConfig) (*httpBackend, error) {
 		timeout = t
 	}
 
-	var p poster = newSimplePoster(cfg.Location, timeout, cfg.SkipTLSVerification)
-
-	// If configured, create a retryBuffer per backend.
-	// This way we serialize retries against each backend.
-	if cfg.BufferSizeMB > 0 {
-		max := DefaultMaxDelayInterval
-		if cfg.MaxDelayInterval != "" {
-			m, err := time.ParseDuration(cfg.MaxDelayInterval)
-			if err != nil {
-				return nil, fmt.Errorf("error parsing max retry time %v", err)
-			}
-			max = m
+	if cfg.BufferSizeMB < 0 {
+		return nil, errors.New("buffer-size-mb 不能为负数")
+	}
+	max := DefaultMaxDelayInterval
+	if cfg.MaxDelayInterval != "" {
+		m, err := time.ParseDuration(cfg.MaxDelayInterval)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing max retry time %v", err)
 		}
-
-		batch := DefaultBatchSizeKB * KB
-		if cfg.MaxBatchKB > 0 {
-			batch = cfg.MaxBatchKB * KB
+		if m <= 0 {
+			return nil, errors.New("max-delay-interval 必须大于 0")
 		}
+		max = m
+	}
 
-		p = newRetryBuffer(cfg.BufferSizeMB*MB, batch, max, p)
+	batch := DefaultBatchSizeKB * KB
+	if cfg.MaxBatchKB > 0 {
+		batch = cfg.MaxBatchKB * KB
+	} else if cfg.MaxBatchKB < 0 {
+		return nil, errors.New("max-batch-kb 不能为负数")
 	}
 
 	return &httpBackend{
-		poster: p,
-		name:   cfg.Name,
+		poster:      newSimplePoster(cfg.Location, timeout, cfg.SkipTLSVerification),
+		name:        cfg.Name,
+		maxBuffered: int64(cfg.BufferSizeMB) * MB,
+		maxBatch:    batch,
+		maxDelay:    max,
 	}, nil
 }
 
-var ErrBufferFull = errors.New("retry buffer full")
+func defaultQueuePath(name string) string {
+	safeName := strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, name)
+	if safeName == "" {
+		safeName = "http-relay"
+	}
+	sum := sha256.Sum256([]byte(name))
+	return filepath.Join(DefaultQueueDir, fmt.Sprintf("%s-%x.queue.db", safeName, sum[:4]))
+}
 
 var bufPool = sync.Pool{New: func() interface{} { return new(bytes.Buffer) }}
 

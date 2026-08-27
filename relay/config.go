@@ -24,6 +24,9 @@ type HTTPConfig struct {
 	// Default retention policy to set for forwarded requests
 	DefaultRetentionPolicy string `toml:"default-retention-policy"`
 
+	// QueuePath 是持久化队列文件路径。启用 buffer-size-mb 时使用。
+	QueuePath string `toml:"queue-path"`
+
 	// Outputs is a list of backed servers where writes will be forwarded
 	Outputs []HTTPOutputConfig `toml:"output"`
 }
@@ -39,7 +42,8 @@ type HTTPOutputConfig struct {
 	// The format used is the same seen in time.ParseDuration
 	Timeout string `toml:"timeout"`
 
-	// Buffer failed writes up to maximum count. (Default 0, retry/buffering disabled)
+	// BufferSizeMB 是该后端持久化待投递队列的容量上限。
+	// 为所有 HTTP output 配置正值后启用原子持久化和异步投递。
 	BufferSizeMB int `toml:"buffer-size-mb"`
 
 	// Maximum batch size in KB (Default 512)
