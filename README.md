@@ -28,6 +28,9 @@ name = "example-http"
 # TCP address to bind to, for HTTP server.
 bind-addr = "127.0.0.1:9096"
 
+# 该 relay 的 output worker 共用一个持久化队列文件。
+queue-path = "/var/lib/influxdb-relay/example-http.queue.db"
+
 # Enable HTTPS requests.
 ssl-combined-pem = "/etc/ssl/influxdb-relay.pem"
 
@@ -36,9 +39,12 @@ output = [
     # name: name of the backend, used for display purposes only.
     # location: full URL of the /write endpoint of the backend
     # timeout: Go-parseable time duration. Fail writes if incomplete in this time.
+    # buffer-size-mb: 单个 output 的活动持久化队列上限。
+    # max-batch-kb: 单个 output worker 合并的最大请求体。
+    # max-delay-interval: 最大重试间隔。
     # skip-tls-verification: skip verification for HTTPS location. WARNING: it's insecure. Don't use in production.
-    { name="local1", location="http://127.0.0.1:8086/write", timeout="10s" },
-    { name="local2", location="http://127.0.0.1:7086/write", timeout="10s" },
+    { name="local1", location="http://127.0.0.1:8086/write", timeout="10s", buffer-size-mb=100, max-batch-kb=512, max-delay-interval="5s" },
+    { name="local2", location="http://127.0.0.1:7086/write", timeout="10s", buffer-size-mb=100, max-batch-kb=512, max-delay-interval="5s" },
 ]
 
 [[udp]]
@@ -104,32 +110,34 @@ The setup should look like this:
 
 
 
-The relay will listen for HTTP or UDP writes and write the data to each InfluxDB server via the HTTP write or UDP endpoint, as appropriate. If the write is sent via HTTP, the relay will return a success response as soon as one of the InfluxDB servers returns a success. If any InfluxDB server returns a 4xx response, that will be returned to the client immediately. If all servers return a 5xx, a 5xx will be returned to the client. If some but not all servers return a 5xx that will not be returned to the client. You should monitor each instance's logs for 5xx errors.
+The relay will listen for HTTP or UDP writes and write the data to each InfluxDB server via the HTTP write or UDP endpoint, as appropriate.
+
+HTTP 推荐启用持久化队列。启用后，一次请求会在同一个本地事务中写入全部 output 的独立队列；事务提交后 relay 返回 204，各 output worker 再异步投递。某个远端 output 故障不会阻塞其他 output，也不会让请求 goroutine 等待远端恢复。未配置持久化队列时仍保留旧的同步转发行为，仅用于兼容旧配置。
 
 With this setup a failure of one Relay or one InfluxDB can be sustained while still taking writes and serving queries. However, the recovery process might require operator intervention.
 
-## Buffering
+## 持久化队列
 
-The relay can be configured to buffer failed requests for HTTP backends.
-The intent of this logic is reduce the number of failures during short outages or periodic network issues.
-> This retry logic is **NOT** sufficient for for long periods of downtime as all data is buffered in RAM
+为同一个 HTTP relay 的**全部** output 配置正数 `buffer-size-mb` 后启用。不能在一个 relay 内混用持久化和同步 output，因为那会破坏全量原子入队语义。
 
-Buffering has the following configuration options (configured per HTTP backend):
+配置项：
 
-* buffer-size-mb -- An upper limit on how much point data to keep in memory (in MB)
-* max-batch-kb -- A maximum size on the aggregated batches that will be submitted (in KB)
-* max-delay-interval -- the max delay between retry attempts per backend.
-    The initial retry delay is 500ms and is doubled after every failure.
+* `queue-path`：该 HTTP relay 的 BoltDB 队列文件。默认位于 `/var/lib/influxdb-relay`。
+* `buffer-size-mb`：单个 output 活动队列的逻辑容量上限。
+* `max-batch-kb`：worker 一次合并投递的最大请求体，默认 512KB。
+* `max-delay-interval`：指数退避上限，默认 10 秒；实际等待会加入随机抖动。
+* `timeout`：单次远端 HTTP 请求超时，默认 10 秒。
 
-If the buffer is full then requests are dropped and an error is logged.
-If a requests makes it into the buffer it is retried until success.
+通过解析和校验的请求在持久化阶段只会出现两种确定结果：
 
-Retries are serialized to a single backend. In addition, writes will be aggregated and batched as long as the body of the request will be less than `max-batch-kb`
-If buffered requests succeed then there is no delay between subsequent attempts.
+1. 数据已在一个本地事务中进入全部 output 队列，返回 204。
+2. 任一 output 队列已满或 WAL 提交失败，整个事务回滚并返回 503；队列满时还会返回 `Retry-After: 1`。
 
-If the relay stays alive the entire duration of a downed backend server without filling that server's allocated buffer, and the relay can stay online until the entire buffer is flushed, it would mean that no operator intervention would be required to "recover" the data. The data will simply be batched together and written out to the recovered server in the order it was received.
+每个 output 严格从自己的 FIFO 队列头部消费。网络错误、408、425、429 和 5xx 使用指数退避重试；其他响应进入该 output 的 dead-letter，避免错误数据永久堵住队首。dead-letter 的逻辑容量也以该 output 的 `buffer-size-mb` 为上限，超过后淘汰最旧记录并记录日志。
 
-*NOTE*: The limits for buffering are not hard limits on the memory usage of the application, and there will be additional overhead that would be much more challenging to account for. The limits listed are just for the amount of point line protocol (including any added timestamps, if applicable). Factors such as small incoming batch sizes and a smaller max batch size will increase the overhead in the buffer. There is also the general application memory overhead to account for. This means that a machine with 2GB of memory should not have buffers that sum up to _almost_ 2GB.
+投递保证是 **at-least-once**：relay 在远端写成功之后、删除 WAL 记录之前崩溃时，重启后会重放该记录。规范化后的点包含固定时间戳，因此重放相同 series/timestamp 通常由 InfluxDB 按覆盖写处理，但业务仍不应假设 exactly-once。
+
+容量规划至少应预留 `2 × 所有 output 的 buffer-size-mb 之和`，再加 BoltDB 页和文件系统开销。BoltDB 会复用已释放页面，但队列清空后文件大小不会立即缩小。队列文件以 `0600` 创建，其中包含请求正文、查询参数和 Authorization header；请限制目录权限并纳入磁盘监控。output 的 `name` 是持久化 bucket 标识，存在积压时不要随意改名。
 
 ## Recovery
 
@@ -159,9 +167,8 @@ While `influxdb-relay` does provide some level of high availability, there are a
 
 - `influxdb-relay` will not relay the `/query` endpoint, and this includes schema modification (create database, `DROP`s, etc). This means that databases must be created before points are written to the backends.
 - Continuous queries will still only write their results locally. If a server goes down, the continuous query will have to be backfilled after the data has been recovered for that instance.
-- Overwriting points is potentially unpredictable. For example, given servers A and B, if B is down, and point X is written (we'll call the value X1) just before B comes back online, that write is queued behind every other write that occurred while B was offline. Once B is back online, the first buffered write succeeds, and all new writes are now allowed to pass-through. At this point (before X1 is written to B), X is written again (with value X2 this time) to both A and B. When the relay reaches the end of B's buffered writes, it will write X (with value X1) to B... At this point A now has X2, but B has X1.
-  - It is probably best to avoid re-writing points (if possible). Otherwise, please be aware that overwriting the same field for a given point can lead to data differences.
-  - This could potentially be mitigated by waiting for the buffer to flush before opening writes back up to being passed-through.
+- 每个 output 内部保持 FIFO，但故障 output 清空积压前仍落后于正常 output。查询负载均衡器应在该 output 追平前将其摘除，避免读到不完整数据。
+- WAL 提供 at-least-once 而不是 exactly-once。重放相同 series/timestamp 时可能覆盖字段，因此应避免依赖写入次数产生业务副作用。
 
 ## Building
 
@@ -205,4 +212,3 @@ docker run -v $(pwd):/root/go/src/github.com/influxdata/influxdb-relay influxdb-
 To build packages for other platforms or architectures, use the
 `--platform` and `--arch` options. For example, to build an amd64
 package for Mac OS X, use the options `--package --platform darwin`.
-
