@@ -1,17 +1,63 @@
-
+# 基础配置示例：HTTP 使用兼容性的同步转发模式，UDP 使用无确认转发。
+# 生产环境建议参考 sample_buffered.toml，为全部 HTTP output 启用持久化队列。
 
 [[http]]
+# name：relay 名称，用于启动日志和错误日志；同一进程内必须唯一。
 name = "example-http"
+
+# bind-addr：HTTP 监听地址，格式为 "IP:端口"。
+# 127.0.0.1 仅允许本机访问；对外提供服务时可按网络策略改为 0.0.0.0。
 bind-addr = "127.0.0.1:9096"
+
+# ssl-combined-pem：可选，包含服务端证书和私钥的 PEM 文件路径。
+# 留空或不配置时使用 HTTP；配置后使用 HTTPS，并应限制私钥文件权限。
+# ssl-combined-pem = "/etc/influxdb-relay/server.pem"
+
+# default-retention-policy：可选。客户端未传 rp 参数时，向所有 output 补充的默认保留策略。
+# 客户端已经传入 rp 时不会覆盖。留空表示不自动补充。
+# default-retention-policy = "autogen"
+
+# queue-path：持久化队列文件路径，仅在全部 output 的 buffer-size-mb 都大于 0 时生效。
+# 未显式配置时默认写入 /var/lib/influxdb-relay；同一队列文件不能由多个进程共享。
+# queue-path = "/var/lib/influxdb-relay/example-http.queue.db"
+
+# output：HTTP 写入目标列表。每个客户端请求都会分发到列表中的全部目标。
+# 各字段含义：
+#   name：output 的唯一名称，用于日志；持久化模式下也是 bucket 标识，有积压时不要改名。
+#   location：完整写入地址，必须包含 InfluxDB/Kapacitor 的 /write 路径。
+#   timeout：单次后端 HTTP 请求超时，支持 "500ms"、"10s"、"1m"，默认 10s。
+#   buffer-size-mb：单个 output 的活动持久化队列上限；0 表示兼容性的同步模式。
+#                   同一个 HTTP relay 必须全部为 0，或全部配置为正数，不能混用。
+#   max-batch-kb：持久化 worker 一次合并投递的最大正文，默认 512KB。
+#   max-delay-interval：网络错误、408、425、429、5xx 的最大重试间隔，默认 10s。
+#   skip-tls-verification：是否跳过 HTTPS 证书校验，默认 false；生产环境不应设为 true。
 output = [
-    { name="local1", location = "http://127.0.0.1:8086/write" },
-    { name="local2", location = "http://127.0.0.1:7086/write" },
+    { name="local1", location="http://127.0.0.1:8086/write", timeout="10s" },
+    { name="local2", location="http://127.0.0.1:7086/write", timeout="10s" },
 ]
 
 [[udp]]
+# name：UDP relay 名称，用于日志；同一进程内必须唯一。
 name = "example-udp"
+
+# bind-addr：UDP 监听地址，格式为 "IP:端口"。
+# UDP 与 HTTP 可以使用相同端口号，因为它们属于不同传输协议。
 bind-addr = "127.0.0.1:9096"
-read-buffer = 0 # default
+
+# precision：输入和输出时间戳精度。
+# 可选值为 n（纳秒）、u（微秒）、ms、s、m、h；应与发送端使用的精度一致。
+precision = "n"
+
+# read-buffer：UDP socket 接收缓冲区字节数。
+# 0 表示使用操作系统默认值；高吞吐场景可增大，同时检查系统 socket 缓冲上限。
+read-buffer = 0
+
+# output：UDP 写入目标列表。UDP 没有远端确认、重试和持久化队列。
+# 各字段含义：
+#   name：output 的唯一日志名称。
+#   location：目标 UDP 地址，格式为 "主机:端口"。
+#   mtu：单个 UDP 输出载荷的最大字节数，默认 1024；relay 会按行拆包。
+#        如果单行数据本身超过 mtu，该行无法发送并会记录错误。
 output = [
     { name="local1", location="127.0.0.1:8089", mtu=512 },
     { name="local2", location="127.0.0.1:7089", mtu=1024 },

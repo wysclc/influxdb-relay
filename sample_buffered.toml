@@ -1,10 +1,42 @@
-
+# 推荐的 HTTP 持久化配置示例。
+# 客户端请求通过解析后，会在一个本地事务中原子写入全部 output 队列；提交成功返回 204。
+# 每个 output 由独立 FIFO worker 异步投递，一个远端故障不会阻塞其他 output。
 
 [[http]]
+# name：relay 唯一名称，用于日志；也参与未配置 queue-path 时的默认文件名生成。
 name = "example-http"
+
+# bind-addr：HTTP 监听地址，格式为 "IP:端口"。
 bind-addr = "127.0.0.1:9096"
+
+# queue-path：该 HTTP relay 的 BoltDB WAL 文件。
+# 文件以 0600 权限打开，保存正文、查询参数和 Authorization header。
+# 目录必须可由运行用户写入，且一个文件只能由一个 relay 进程使用。
 queue-path = "/var/lib/influxdb-relay/example-http.queue.db"
+
+# 可选：客户端没有传 rp 时补充默认保留策略；不会覆盖已有 rp。
+# default-retention-policy = "autogen"
+
+# 可选：配置包含证书和私钥的 PEM 文件后启用 HTTPS。
+# ssl-combined-pem = "/etc/influxdb-relay/server.pem"
+
+# 持久化模式要求列表中每个 output 的 buffer-size-mb 都为正数。
+# 入队会在一个 BoltDB 事务中写入所有 output；任一队列已满时整体回滚并返回 503。
+#
+# output 字段含义：
+#   name：output 唯一名称，也是持久化 bucket 标识；存在积压时不要修改。
+#   location：完整的远端 /write URL。
+#   timeout：每次远端请求的超时，默认 10s。它不阻塞其他 output 或客户端 ACK。
+#   buffer-size-mb：该 output 活动队列的逻辑容量上限。
+#                   dead-letter 另有同等上限，因此磁盘至少按所有该值之和的 2 倍规划。
+#   max-batch-kb：worker 按相同查询参数和认证信息合并正文的上限，默认 512KB。
+#   max-delay-interval：可重试错误的指数退避上限，默认 10s；实际等待包含随机抖动。
+#   skip-tls-verification：跳过 TLS 证书校验，默认 false；仅限可信测试环境使用。
 output = [
-    { name="local1", location = "http://127.0.0.1:8086/write", buffer-size-mb = 100, max-batch-kb = 50, max-delay-interval = "5s" },
-    { name="local2", location = "http://127.0.0.1:7086/write", buffer-size-mb = 100, max-batch-kb = 50, max-delay-interval = "5s" },
+    { name="local1", location="http://127.0.0.1:8086/write", timeout="10s", buffer-size-mb=100, max-batch-kb=512, max-delay-interval="5s", skip-tls-verification=false },
+    { name="local2", location="http://127.0.0.1:7086/write", timeout="10s", buffer-size-mb=100, max-batch-kb=512, max-delay-interval="5s", skip-tls-verification=false },
 ]
+
+# 重试分类：网络错误、HTTP 408、425、429 和 5xx 会指数退避重试。
+# 其他非 2xx 响应会移入该 output 的有界 dead-letter，避免错误数据永久堵住队首。
+# 投递保证为 at-least-once：远端成功后、WAL 删除前若进程崩溃，重启后可能重放。

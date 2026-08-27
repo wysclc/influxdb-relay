@@ -1,24 +1,29 @@
-# The relay can also be used to dual write data to Kapacitor
-#
-# There are a few advantages of using the relay instead of relying on InfluxDB subscriptions
-#
-# 1. Traffic is HTTP/TCP meaning you don't have to worry about dropped UDP packets
-# 2. Less load on InfluxDB since it doesn't have to fork the data.
-# 3. Slighly lower latency since there is one less hop.
-#
-# Kapacitor is wire compatible with InfluxDB for writes.
-# This means you can add a Kapacitor instance to the output list as if it were an InfluxDB instance.
-#
+# Kapacitor 与 InfluxDB 的 /write 接口兼容，可以作为普通 HTTP output 使用。
+# 与 InfluxDB subscription 相比，relay 使用 HTTP/TCP、减少 InfluxDB 分发负担，并少一次转发。
+# 本示例把每次写入同时持久化投递到两个 InfluxDB 和一个 Kapacitor。
 
-
-# This example config sends all writes to
-# two InfluxDB hosts and a single Kapacitor host.
 [[http]]
+# name：relay 唯一名称，用于日志。
 name = "kapacitor-http"
+
+# bind-addr：HTTP 监听地址；0.0.0.0 表示监听所有网卡，应配合防火墙或反向代理限制访问。
 bind-addr = "0.0.0.0:9096"
+
+# default-retention-policy：客户端未传 rp 时自动补充的保留策略。
+# Kapacitor 通常需要正确的数据库和保留策略才能把数据交给对应任务。
 default-retention-policy = "autogen"
+
+# queue-path：三个 output 共用的本地 WAL；内部按 output 名称使用独立 FIFO bucket。
+queue-path = "/var/lib/influxdb-relay/kapacitor-http.queue.db"
+
+# 所有 output 都必须启用正数 buffer-size-mb，才能保证一次事务原子写入全部队列。
+# name 必须唯一且应保持稳定；location 必须包含各服务的 /write 路径。
+# timeout 是单次远端请求超时；max-batch-kb 是批量正文上限；max-delay-interval 是退避上限。
 output = [
-    { name="influxdb1", location = "http://influxdb1:8086/write" },
-    { name="influxdb2", location = "http://influxdb2:8086/write" },
-    { name="kapacitor1", location = "http://kapacitor1:9092/write" },
+    { name="influxdb1", location="http://influxdb1:8086/write", timeout="10s", buffer-size-mb=100, max-batch-kb=512, max-delay-interval="5s" },
+    { name="influxdb2", location="http://influxdb2:8086/write", timeout="10s", buffer-size-mb=100, max-batch-kb=512, max-delay-interval="5s" },
+    { name="kapacitor1", location="http://kapacitor1:9092/write", timeout="10s", buffer-size-mb=100, max-batch-kb=512, max-delay-interval="5s" },
 ]
+
+# 单个 output 故障时，另外两个 worker 继续投递；故障 output 恢复后按 FIFO 补发积压。
+# 三个 100MB 活动队列加三个最多 100MB dead-letter，磁盘至少预留约 600MB 加数据库开销。
