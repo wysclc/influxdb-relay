@@ -46,6 +46,8 @@ const (
 	DefaultHTTPTimeout      = 10 * time.Second
 	DefaultMaxDelayInterval = 10 * time.Second
 	DefaultBatchSizeKB      = 512
+	DefaultMinBatchSizeKB   = 128
+	DefaultBatchDuration    = 5 * time.Second
 	DefaultQueueDir         = "/var/lib/influxdb-relay"
 	DefaultShutdownTimeout  = 30 * time.Second
 
@@ -455,6 +457,9 @@ type httpBackend struct {
 	name        string
 	maxBuffered int64
 	maxBatch    int
+	minBatch    int
+	adaptive    bool
+	targetBatch time.Duration
 	maxDelay    time.Duration
 }
 
@@ -493,12 +498,41 @@ func newHTTPBackend(cfg *HTTPOutputConfig) (*httpBackend, error) {
 	} else if cfg.MaxBatchKB < 0 {
 		return nil, errors.New("max-batch-kb 不能为负数")
 	}
+	minBatch := DefaultMinBatchSizeKB * KB
+	if cfg.MinBatchKB > 0 {
+		minBatch = cfg.MinBatchKB * KB
+	} else if cfg.MinBatchKB < 0 {
+		return nil, errors.New("min-batch-kb 不能为负数")
+	}
+	if minBatch > batch {
+		if cfg.MinBatchKB > 0 {
+			return nil, errors.New("min-batch-kb 不能大于 max-batch-kb")
+		}
+		minBatch = batch
+	}
+	targetBatch := DefaultBatchDuration
+	if cfg.TargetBatchDuration != "" {
+		t, err := time.ParseDuration(cfg.TargetBatchDuration)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing target batch duration %v", err)
+		}
+		if t <= 0 {
+			return nil, errors.New("target-batch-duration 必须大于 0")
+		}
+		targetBatch = t
+	}
+	if cfg.AdaptiveBatch && targetBatch >= timeout {
+		return nil, errors.New("启用 adaptive-batch 时 target-batch-duration 必须小于 timeout")
+	}
 
 	return &httpBackend{
 		poster:      newSimplePoster(cfg.Location, timeout, cfg.SkipTLSVerification),
 		name:        cfg.Name,
 		maxBuffered: int64(cfg.BufferSizeMB) * MB,
 		maxBatch:    batch,
+		minBatch:    minBatch,
+		adaptive:    cfg.AdaptiveBatch,
+		targetBatch: targetBatch,
 		maxDelay:    max,
 	}, nil
 }

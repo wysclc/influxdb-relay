@@ -31,11 +31,18 @@ queue-path = "/var/lib/influxdb-relay/example-http.queue.db"
 #   buffer-size-mb：该 output 活动队列的逻辑目标容量；空间不足时从队首淘汰。
 #                   dead-letter 另有同等上限，因此磁盘至少按所有该值之和的 2 倍规划。
 #   max-batch-kb：worker 按相同查询参数和认证信息合并正文的上限，默认 512KB。
+#                 adaptive-batch=true 时作为自适应上限；单条记录不会拆分，可能超过此值。
+#   adaptive-batch：是否根据该 output 的写入耗时和吞吐量自适应批量，默认 false。
+#                   各 output 独立学习；可重试错误立即减半，链路恢复后最多逐次增长 25%。
+#   min-batch-kb：自适应批量下限，默认 128KB，不能大于 max-batch-kb。
+#                 小于此值的零散成功请求不参与带宽估算，避免误判网络拥堵。
+#   target-batch-duration：期望一次 HTTP 写入完成的时间，默认 5s。
+#                          控制器按平滑吞吐量估算合适批量；值越小越保守，且必须小于 timeout。
 #   max-delay-interval：可重试错误的指数退避上限，默认 10s；实际等待包含随机抖动。
 #   skip-tls-verification：跳过 TLS 证书校验，默认 false；仅限可信测试环境使用。
 output = [
     { name="local1", location="http://127.0.0.1:8086/write", timeout="10s", buffer-size-mb=100, max-batch-kb=512, max-delay-interval="5s", skip-tls-verification=false },
-    { name="local2", location="http://127.0.0.1:7086/write", timeout="10s", buffer-size-mb=100, max-batch-kb=512, max-delay-interval="5s", skip-tls-verification=false },
+    { name="local2", location="http://127.0.0.1:7086/write", timeout="30s", buffer-size-mb=100, max-batch-kb=2048, adaptive-batch=true, min-batch-kb=128, target-batch-duration="5s", max-delay-interval="5s", skip-tls-verification=false },
 ]
 
 # 重试分类：网络错误、HTTP 408、425、429 和 5xx 会指数退避重试。

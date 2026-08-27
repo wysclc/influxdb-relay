@@ -40,7 +40,8 @@ output = [
     # location: full URL of the /write endpoint of the backend
     # timeout: Go-parseable time duration. Fail writes if incomplete in this time.
     # buffer-size-mb: 单个 output 的活动持久化队列上限。
-    # max-batch-kb: 单个 output worker 合并的最大请求体。
+    # max-batch-kb: 单个 output worker 合并的最大请求体；启用自适应时作为上限。
+    # adaptive-batch/min-batch-kb/target-batch-duration: 自适应开关、下限和目标耗时。
     # max-delay-interval: 最大重试间隔。
     # skip-tls-verification: skip verification for HTTPS location. WARNING: it's insecure. Don't use in production.
     { name="local1", location="http://127.0.0.1:8086/write", timeout="10s", buffer-size-mb=100, max-batch-kb=512, max-delay-interval="5s" },
@@ -124,7 +125,10 @@ With this setup a failure of one Relay or one InfluxDB can be sustained while st
 
 * `queue-path`：该 HTTP relay 的 BoltDB 队列文件。默认位于 `/var/lib/influxdb-relay`。
 * `buffer-size-mb`：单个 output 活动队列的逻辑目标容量。空间不足时从队首淘汰最老记录。
-* `max-batch-kb`：worker 一次合并投递的最大请求体，默认 512KB。
+* `max-batch-kb`：worker 一次合并投递的最大请求体，默认 512KB；启用自适应后作为上限。
+* `adaptive-batch`：是否为该 output 启用自适应批量，默认 `false`。各 output 独立学习，互不影响。
+* `min-batch-kb`：自适应批量下限，默认 128KB，不能大于 `max-batch-kb`。
+* `target-batch-duration`：期望一次远端写入完成的时间，默认 5 秒。值越小，批量调整越保守；启用自适应时必须小于 `timeout`。
 * `max-delay-interval`：指数退避上限，默认 10 秒；实际等待会加入随机抖动。
 * `timeout`：单次远端 HTTP 请求超时，默认 10 秒。
 
@@ -137,6 +141,8 @@ With this setup a failure of one Relay or one InfluxDB can be sustained while st
 如果单条最新记录本身超过 `buffer-size-mb`，该 output 会清空旧的待投递记录，并把这条记录作为唯一记录保留；因此该配置是滚动队列的目标容量，不是单条记录的硬限制。故障持续过久时会永久丢失最老数据。如果业务要求每条数据都保留，应通过外部磁盘和队列监控提前扩容，而不能只依赖客户端 204 或 relay 日志。
 
 每个 output 严格从自己的 FIFO 队列头部消费。网络错误、408、425、429 和 5xx 使用指数退避重试；其他响应进入该 output 的 dead-letter，避免错误数据永久堵住队首。dead-letter 的逻辑容量也以该 output 的 `buffer-size-mb` 为上限，超过后淘汰最旧记录并记录日志。
+
+启用 `adaptive-batch` 后，worker 使用平滑后的端到端吞吐量估算下一批大小。慢速成功会逐步缩小批量，可重试错误会立即把批量减半，成功恢复时每次最多增长 25%，并始终限制在 `min-batch-kb` 与 `max-batch-kb` 之间。小于下限的零散请求不会参与估算。该上限只限制多条队列记录的合并：为了保持原始请求的完整投递和重试语义，单条记录不会拆分，因此可能大于当前批量上限。
 
 对于已经入队的 output，投递保证是 **at-least-once**：relay 在远端写成功之后、删除 WAL 记录之前崩溃时，重启后会重放该记录。规范化后的点包含固定时间戳，因此重放相同 series/timestamp 通常由 InfluxDB 按覆盖写处理，但业务仍不应假设 exactly-once。
 

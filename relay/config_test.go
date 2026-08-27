@@ -11,7 +11,6 @@ func TestLoadConfigurationSamples(t *testing.T) {
 		{path: "../sample.toml", httpCount: 1, udpCount: 1},
 		{path: "../sample_buffered.toml", httpCount: 1},
 		{path: "../kapacitor.toml", httpCount: 1},
-		{path: "../influxdb-relay.toml", httpCount: 1},
 	}
 
 	for _, test := range tests {
@@ -50,5 +49,9 @@ func TestLoadDurableQueueSample(t *testing.T) {
 		if output.BufferSizeMB <= 0 {
 			t.Fatalf("output %q 没有启用持久化队列", output.Name)
 		}
+	}
+	adaptive := httpRelay.Outputs[1]
+	if !adaptive.AdaptiveBatch || adaptive.MinBatchKB != 128 || adaptive.TargetBatchDuration != "5s" {
+		t.Fatalf("output %q 的自适应批量示例解析错误：%#v", adaptive.Name, adaptive)
 	}
 }

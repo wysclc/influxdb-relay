@@ -30,6 +30,9 @@ bind-addr = "127.0.0.1:9096"
 #                   0 表示兼容性的同步模式。
 #                   同一个 HTTP relay 必须全部为 0，或全部配置为正数，不能混用。
 #   max-batch-kb：持久化 worker 一次合并投递的最大正文，默认 512KB。
+#   adaptive-batch：持久化模式是否按各 output 的端到端吞吐量动态调节批量，默认 false。
+#   min-batch-kb：自适应批量下限，默认 128KB，不能大于 max-batch-kb。
+#   target-batch-duration：自适应控制器期望的单次写入耗时，默认 "5s"；必须小于 timeout。
 #   max-delay-interval：网络错误、408、425、429、5xx 的最大重试间隔，默认 10s。
 #   skip-tls-verification：是否跳过 HTTPS 证书校验，默认 false；生产环境不应设为 true。
 output = [

@@ -50,6 +50,17 @@ type HTTPOutputConfig struct {
 	// Maximum batch size in KB (Default 512)
 	MaxBatchKB int `toml:"max-batch-kb"`
 
+	// AdaptiveBatch 根据该 output 的端到端写入速度动态调整合并上限。
+	// MaxBatchKB 作为上限，单条队列记录不会被拆分。
+	AdaptiveBatch bool `toml:"adaptive-batch"`
+
+	// MinBatchKB 是自适应批量的下限（Default 128）。
+	MinBatchKB int `toml:"min-batch-kb"`
+
+	// TargetBatchDuration 是自适应控制器期望的单次写入耗时（Default 5s）。
+	// The format used is the same seen in time.ParseDuration
+	TargetBatchDuration string `toml:"target-batch-duration"`
+
 	// Maximum delay between retry attempts.
 	// The format used is the same seen in time.ParseDuration (Default 10s)
 	MaxDelayInterval string `toml:"max-delay-interval"`

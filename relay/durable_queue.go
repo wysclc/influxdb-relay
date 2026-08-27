@@ -195,6 +195,11 @@ func (q *durableQueue) enqueue(body []byte, query, auth string) (enqueueResult, 
 
 func (q *durableQueue) runBackend(backend *httpBackend) {
 	defer q.wg.Done()
+	batchControl := newBatchController(backend)
+	if batchControl.enabled {
+		log.Printf("output %q 启用自适应批量（initial=%dKB, min=%dKB, max=%dKB, target=%v）",
+			backend.name, batchControl.limit()/KB, batchControl.minimum/KB, batchControl.maximum/KB, batchControl.target)
+	}
 
 	interval := queueInitialRetry
 	if backend.maxDelay < interval {
@@ -208,7 +213,7 @@ func (q *durableQueue) runBackend(backend *httpBackend) {
 		default:
 		}
 
-		batch, found, err := q.peekBatch(backend)
+		batch, found, err := q.peekBatch(backend, batchControl.limit())
 		if err != nil {
 			log.Printf("读取 output %q 的持久化队列失败: %v", backend.name, err)
 			if !q.waitRetry(interval) {
@@ -249,8 +254,9 @@ func (q *durableQueue) runBackend(backend *httpBackend) {
 				interval = nextRetry(interval, backend.maxDelay)
 				continue
 			}
-			log.Printf("output %q HTTP 写入成功（status=%d, records=%d, bytes=%d, duration=%v）",
-				backend.name, resp.StatusCode, len(batch.ids), len(batch.body), attemptDuration)
+			batchControl.success(len(batch.body), attemptDuration)
+			log.Printf("output %q HTTP 写入成功（status=%d, records=%d, bytes=%d, duration=%v, batch-limit=%dKB）",
+				backend.name, resp.StatusCode, len(batch.ids), len(batch.body), attemptDuration, batchControl.limit()/KB)
 			interval = queueInitialRetry
 			if interval > backend.maxDelay {
 				interval = backend.maxDelay
@@ -281,15 +287,16 @@ func (q *durableQueue) runBackend(backend *httpBackend) {
 			continue
 		}
 
+		batchControl.failure()
 		if postErr != nil {
-			log.Printf("output %q HTTP 写入失败，将重试（records=%d, bytes=%d, duration=%v）: %v",
-				backend.name, len(batch.ids), len(batch.body), attemptDuration, postErr)
+			log.Printf("output %q HTTP 写入失败，将重试（records=%d, bytes=%d, duration=%v, batch-limit=%dKB）: %v",
+				backend.name, len(batch.ids), len(batch.body), attemptDuration, batchControl.limit()/KB, postErr)
 		} else if resp != nil {
-			log.Printf("output %q HTTP 写入失败，将重试（records=%d, bytes=%d, duration=%v）: %s",
-				backend.name, len(batch.ids), len(batch.body), attemptDuration, responseFailure(resp))
+			log.Printf("output %q HTTP 写入失败，将重试（records=%d, bytes=%d, duration=%v, batch-limit=%dKB）: %s",
+				backend.name, len(batch.ids), len(batch.body), attemptDuration, batchControl.limit()/KB, responseFailure(resp))
 		} else {
-			log.Printf("output %q HTTP 写入失败，将重试（records=%d, bytes=%d, duration=%v）: 未收到有效响应",
-				backend.name, len(batch.ids), len(batch.body), attemptDuration)
+			log.Printf("output %q HTTP 写入失败，将重试（records=%d, bytes=%d, duration=%v, batch-limit=%dKB）: 未收到有效响应",
+				backend.name, len(batch.ids), len(batch.body), attemptDuration, batchControl.limit()/KB)
 		}
 
 		if !q.waitRetry(interval) {
@@ -299,7 +306,7 @@ func (q *durableQueue) runBackend(backend *httpBackend) {
 	}
 }
 
-func (q *durableQueue) peekBatch(backend *httpBackend) (durableBatch, bool, error) {
+func (q *durableQueue) peekBatch(backend *httpBackend, batchLimit int) (durableBatch, bool, error) {
 	var result durableBatch
 	err := q.db.View(func(tx *bolt.Tx) error {
 		output := tx.Bucket(queueRootBucket).Bucket([]byte(backend.name))
@@ -314,7 +321,7 @@ func (q *durableQueue) peekBatch(backend *httpBackend) (durableBatch, bool, erro
 				if record.query != result.query || record.auth != result.auth {
 					break
 				}
-				if len(result.body)+len(record.body) > backend.maxBatch {
+				if len(result.body)+len(record.body) > batchLimit {
 					break
 				}
 			} else {
