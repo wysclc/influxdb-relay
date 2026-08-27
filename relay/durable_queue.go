@@ -46,16 +46,9 @@ type durableBatch struct {
 	body  []byte
 }
 
-type fullOutput struct {
-	name         string
-	activeBytes  int64
-	limitBytes   int64
-	droppedBytes int64
-}
-
 type enqueueResult struct {
 	accepted []string
-	full     []fullOutput
+	full     []string
 }
 
 // durableQueue 在一个 BoltDB 事务中把请求写入所有尚有空间的 output。
@@ -152,12 +145,7 @@ func (q *durableQueue) enqueue(body []byte, query, auth string) (enqueueResult, 
 			output := root.Bucket([]byte(backend.name))
 			active := readCounter(output.Bucket(metaBucket), activeBytesKey)
 			if active+recordBytes > backend.maxBuffered {
-				result.full = append(result.full, fullOutput{
-					name:         backend.name,
-					activeBytes:  active,
-					limitBytes:   backend.maxBuffered,
-					droppedBytes: recordBytes,
-				})
+				result.full = append(result.full, backend.name)
 				continue
 			}
 			result.accepted = append(result.accepted, backend.name)
@@ -231,7 +219,9 @@ func (q *durableQueue) runBackend(backend *httpBackend) {
 			}
 		}
 
+		attemptStarted := time.Now()
 		resp, postErr := backend.poster.post(q.ctx, batch.body, batch.query, batch.auth)
+		attemptDuration := time.Since(attemptStarted)
 		if postErr != nil {
 			select {
 			case <-q.stop:
@@ -248,7 +238,8 @@ func (q *durableQueue) runBackend(backend *httpBackend) {
 				interval = nextRetry(interval, backend.maxDelay)
 				continue
 			}
-			log.Printf("%s durable write %.1fkb, statusCode %d", backend.name, float64(len(batch.body))/1024, resp.StatusCode)
+			log.Printf("output %q HTTP 写入成功（status=%d, records=%d, bytes=%d, duration=%v）",
+				backend.name, resp.StatusCode, len(batch.ids), len(batch.body), attemptDuration)
 			interval = queueInitialRetry
 			if interval > backend.maxDelay {
 				interval = backend.maxDelay
@@ -267,7 +258,8 @@ func (q *durableQueue) runBackend(backend *httpBackend) {
 				interval = nextRetry(interval, backend.maxDelay)
 				continue
 			}
-			log.Printf("output %q 返回不可重试响应，已将 %d 条记录移入 dead-letter: %s", backend.name, len(batch.ids), reason)
+			log.Printf("output %q HTTP 写入失败且不可重试，已将记录移入 dead-letter（records=%d, bytes=%d, duration=%v）: %s",
+				backend.name, len(batch.ids), len(batch.body), attemptDuration, reason)
 			if evicted > 0 {
 				log.Printf("output %q 的 dead-letter 达到上限，淘汰了 %d 条最旧记录", backend.name, evicted)
 			}
@@ -279,11 +271,14 @@ func (q *durableQueue) runBackend(backend *httpBackend) {
 		}
 
 		if postErr != nil {
-			log.Printf("投递 output %q 失败，将重试（records=%d, bytes=%d）: %v", backend.name, len(batch.ids), len(batch.body), postErr)
+			log.Printf("output %q HTTP 写入失败，将重试（records=%d, bytes=%d, duration=%v）: %v",
+				backend.name, len(batch.ids), len(batch.body), attemptDuration, postErr)
 		} else if resp != nil {
-			log.Printf("投递 output %q 收到可重试响应，将重试（records=%d, bytes=%d）: %s", backend.name, len(batch.ids), len(batch.body), responseFailure(resp))
+			log.Printf("output %q HTTP 写入失败，将重试（records=%d, bytes=%d, duration=%v）: %s",
+				backend.name, len(batch.ids), len(batch.body), attemptDuration, responseFailure(resp))
 		} else {
-			log.Printf("投递 output %q 未收到有效响应，将重试", backend.name)
+			log.Printf("output %q HTTP 写入失败，将重试（records=%d, bytes=%d, duration=%v）: 未收到有效响应",
+				backend.name, len(batch.ids), len(batch.body), attemptDuration)
 		}
 
 		if !q.waitRetry(interval) {

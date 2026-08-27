@@ -285,12 +285,8 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get("Authorization")
 
 	if h.queue != nil {
-		result, err := h.queue.enqueue(outBytes, query, authHeader)
+		_, err := h.queue.enqueue(outBytes, query, authHeader)
 		putBuf(outBuf)
-		for _, full := range result.full {
-			log.Printf("HTTP relay %q 的 output %q 持久化队列已满，跳过本次数据（active=%d, limit=%d, dropped=%d bytes, accepted_outputs=%d）",
-				h.Name(), full.name, full.activeBytes, full.limitBytes, full.droppedBytes, len(result.accepted))
-		}
 		if err != nil {
 			if errors.Is(err, ErrBufferFull) {
 				w.Header().Set("Retry-After", "1")
