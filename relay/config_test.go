@@ -11,6 +11,7 @@ func TestLoadConfigurationSamples(t *testing.T) {
 		{path: "../sample.toml", httpCount: 1, udpCount: 1},
 		{path: "../sample_buffered.toml", httpCount: 1},
 		{path: "../kapacitor.toml", httpCount: 1},
+		{path: "../influxdb-relay.toml", httpCount: 1},
 	}
 
 	for _, test := range tests {
