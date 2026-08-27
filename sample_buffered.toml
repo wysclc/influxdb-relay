@@ -22,7 +22,7 @@ queue-path = "/var/lib/influxdb-relay/example-http.queue.db"
 # ssl-combined-pem = "/etc/influxdb-relay/server.pem"
 
 # 持久化模式要求列表中每个 output 的 buffer-size-mb 都为正数。
-# 入队会在一个 BoltDB 事务中写入所有有空间的 output；已满 output 跳过并记录数据缺失日志。
+# 入队会在一个 BoltDB 事务中写入所有有空间的 output；已满 output 会静默跳过。
 #
 # output 字段含义：
 #   name：output 唯一名称，也是持久化 bucket 标识；存在积压时不要修改。

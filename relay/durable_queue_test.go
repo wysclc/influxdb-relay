@@ -110,7 +110,7 @@ func TestDurableQueueSkipsOnlyFullOutput(t *testing.T) {
 	if len(result.accepted) != 1 || result.accepted[0] != "second" {
 		t.Fatalf("第二次写入的接收 output 错误: %#v", result.accepted)
 	}
-	if len(result.full) != 1 || result.full[0].name != "first" {
+	if len(result.full) != 1 || result.full[0] != "first" {
 		t.Fatalf("第二次写入的满队列 output 错误: %#v", result.full)
 	}
 	firstActive, _ := queueBytes(t, queue, "first")
