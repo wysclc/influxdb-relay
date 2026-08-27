@@ -23,7 +23,7 @@ queue-path = "/var/lib/influxdb-relay/hk01.queue.db"
 #   max-delay-interval：可重试错误的指数退避上限，默认 10s；实际等待包含随机抖动。
 #   skip-tls-verification：跳过 TLS 证书校验，默认 false；仅限可信测试环境使用。
 output = [
-    { name="hk", location = "http://127.0.0.1:8086/write",timeout = "10s", buffer-size-mb = 100, max-batch-kb = 2048, max-delay-interval = "10s", skip-tls-verification = true },
-    { name="hw", location = "http://192.168.10.2:8086/write",timeout = "60s", buffer-size-mb = 100, max-batch-kb = 2048, max-delay-interval = "10s", skip-tls-verification = true },
-    { name="jl", location = "http://jldb.wangy.buzz/write",timeout = "60s", buffer-size-mb = 100, max-batch-kb = 2048, max-delay-interval = "10s", skip-tls-verification = true},
+    { name="hk", location = "http://127.0.0.1:8086/write",timeout = "10s", buffer-size-mb = 100, max-batch-kb = 2048, max-delay-interval = "15s", skip-tls-verification = true },
+    { name="hw", location = "http://192.168.10.2:8086/write",timeout = "90s", buffer-size-mb = 200, max-batch-kb = 1024, max-delay-interval = "15s", skip-tls-verification = true },
+    { name="jl", location = "http://jldb.wangy.buzz/write",timeout = "60s", buffer-size-mb = 100, max-batch-kb = 1024, max-delay-interval = "15s", skip-tls-verification = true},
 ]

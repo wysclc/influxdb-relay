@@ -2,3 +2,4 @@
 /build
 influxdb-relay
 influxdb-relay.conf
+influxdb-relay.toml
