@@ -38,6 +38,10 @@ type HTTPOutputConfig struct {
 	// Location should be set to the URL of the backend server's write endpoint
 	Location string `toml:"location"`
 
+	// IPFamily 控制域名同时具有 A 和 AAAA 记录时使用的地址族。
+	// 可选值为 auto、prefer-ipv6、ipv6-only、ipv4-only（Default auto）。
+	IPFamily string `toml:"ip-family"`
+
 	// Timeout sets a per-backend timeout for write requests. (Default 10s)
 	// The format used is the same seen in time.ParseDuration
 	Timeout string `toml:"timeout"`

@@ -25,6 +25,8 @@ bind-addr = "127.0.0.1:9096"
 # 各字段含义：
 #   name：output 的唯一名称，用于日志；持久化模式下也是 bucket 标识，有积压时不要改名。
 #   location：完整写入地址，必须包含 InfluxDB/Kapacitor 的 /write 路径。
+#   ip-family：地址族策略，可选 auto、prefer-ipv6、ipv6-only、ipv4-only，默认 auto。
+#              prefer-ipv6 会先连接 AAAA 地址，300ms 未成功再并行回退 A 地址。
 #   timeout：单次后端 HTTP 请求超时，支持 "500ms"、"10s"、"1m"，默认 10s。
 #   buffer-size-mb：单个 output 的活动持久化队列目标容量；空间不足时淘汰最老记录。
 #                   0 表示兼容性的同步模式。

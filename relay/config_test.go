@@ -54,4 +54,7 @@ func TestLoadDurableQueueSample(t *testing.T) {
 	if !adaptive.AdaptiveBatch || adaptive.MinBatchKB != 128 || adaptive.TargetBatchDuration != "5s" {
 		t.Fatalf("output %q 的自适应批量示例解析错误：%#v", adaptive.Name, adaptive)
 	}
+	if adaptive.IPFamily != "prefer-ipv6" {
+		t.Fatalf("output %q 的地址族策略解析错误：%q", adaptive.Name, adaptive.IPFamily)
+	}
 }

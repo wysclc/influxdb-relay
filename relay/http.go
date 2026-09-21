@@ -81,6 +81,9 @@ func NewHTTP(cfg HTTPConfig) (Relay, error) {
 			return nil, fmt.Errorf("HTTP relay %q 存在重复的 output 名称 %q", h.Name(), backend.name)
 		}
 		backendNames[backend.name] = struct{}{}
+		if backend.ipFamily != ipFamilyAuto {
+			log.Printf("HTTP relay %q 的 output %q 使用地址族策略 %q", h.Name(), backend.name, backend.ipFamily)
+		}
 		if backend.maxBuffered > 0 {
 			buffered++
 		}
@@ -399,13 +402,24 @@ type simplePoster struct {
 	location string
 }
 
-func newSimplePoster(location string, timeout time.Duration, skipTLSVerification bool) *simplePoster {
+func newSimplePoster(location string, timeout time.Duration, skipTLSVerification bool, family ipFamily, outputName string) *simplePoster {
 	// Configure custom transport for http.Client
 	// Used for support skip-tls-verification option
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: skipTLSVerification,
 		},
+	}
+	if family != ipFamilyAuto {
+		dialer := newIPFamilyDialer(family)
+		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, network, address)
+			if err == nil {
+				log.Printf("output %q 已建立 %s 连接（remote=%s, policy=%s）",
+					outputName, conn.RemoteAddr().Network(), conn.RemoteAddr(), family)
+			}
+			return conn, err
+		}
 	}
 
 	return &simplePoster{
@@ -461,11 +475,16 @@ type httpBackend struct {
 	adaptive    bool
 	targetBatch time.Duration
 	maxDelay    time.Duration
+	ipFamily    ipFamily
 }
 
 func newHTTPBackend(cfg *HTTPOutputConfig) (*httpBackend, error) {
 	if cfg.Name == "" {
 		cfg.Name = cfg.Location
+	}
+	family, err := parseIPFamily(cfg.IPFamily)
+	if err != nil {
+		return nil, err
 	}
 
 	timeout := DefaultHTTPTimeout
@@ -526,7 +545,7 @@ func newHTTPBackend(cfg *HTTPOutputConfig) (*httpBackend, error) {
 	}
 
 	return &httpBackend{
-		poster:      newSimplePoster(cfg.Location, timeout, cfg.SkipTLSVerification),
+		poster:      newSimplePoster(cfg.Location, timeout, cfg.SkipTLSVerification, family, cfg.Name),
 		name:        cfg.Name,
 		maxBuffered: int64(cfg.BufferSizeMB) * MB,
 		maxBatch:    batch,
@@ -534,6 +553,7 @@ func newHTTPBackend(cfg *HTTPOutputConfig) (*httpBackend, error) {
 		adaptive:    cfg.AdaptiveBatch,
 		targetBatch: targetBatch,
 		maxDelay:    max,
+		ipFamily:    family,
 	}, nil
 }
 
