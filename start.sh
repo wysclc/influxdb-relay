@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 bin=influxdb-relay
-hosts="jp jp2"
+#hosts="jp jp2"
+hosts="jp"
 
 GOOS=linux GOARCH=amd64 go build -o $bin main.go
 
