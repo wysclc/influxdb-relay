@@ -1,0 +1,32 @@
+[[http]]
+# name：relay 唯一名称，用于日志；也参与未配置 queue-path 时的默认文件名生成。
+name = "hk01-influxdb-relay"
+bind-addr = "0.0.0.0:5888"
+
+# queue-path：该 HTTP relay 的 BoltDB WAL 文件。
+# 文件以 0600 权限打开，保存正文、查询参数和 Authorization header。
+# 目录必须可由运行用户写入，且一个文件只能由一个 relay 进程使用。
+queue-path = "/var/lib/influxdb-relay/hk01.queue.db"
+
+# 持久化模式要求列表中每个 output 的 buffer-size-mb 都为正数。
+# 入队会在一个 BoltDB 事务中写入所有尚有空间的 output。
+# 至少一个 output 入队成功就返回 204；只有全部 output 都没有空间时才返回 503。
+# 已满 output 会静默跳过本次数据，跳过的数据不会自动补发。
+#
+# output 字段含义：
+#   name：output 唯一名称，也是持久化 bucket 标识；存在积压时不要修改。
+#   location：完整的远端 /write URL。
+#   timeout：每次远端请求的超时，默认 10s。它不阻塞其他 output 或客户端 ACK。
+#   buffer-size-mb：该 output 活动队列的逻辑容量上限。
+#                   dead-letter 另有同等上限，因此磁盘至少按所有该值之和的 2 倍规划。
+#   max-batch-kb：worker 按相同查询参数和认证信息合并正文的上限，默认 512KB。
+#   max-delay-interval：可重试错误的指数退避上限，默认 10s；实际等待包含随机抖动。
+#   skip-tls-verification：跳过 TLS 证书校验，默认 false；仅限可信测试环境使用。
+# IPFamily 控制域名同时具有 A 和 AAAA 记录时使用的地址族。
+#	可选值为 auto、prefer-ipv6、ipv6-only、ipv4-only（Default auto）。
+
+
+output = [
+    { name = "hw6", location = "http://wangy.buzz:8086/write", ip-family = "ipv6-only", timeout = "90s", buffer-size-mb = 300, max-batch-kb = 4096, adaptive-batch = true, max-delay-interval = "15s", skip-tls-verification = true, compression = "gzip", compression-min-kb = 64 },
+    { name = "jl", location = "http://jldb.wangy.buzz/write", timeout = "60s", buffer-size-mb = 100, max-batch-kb = 2048, max-delay-interval = "15s", skip-tls-verification = true, compression = "gzip", compression-min-kb = 64 },
+]
