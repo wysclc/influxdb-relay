@@ -255,8 +255,9 @@ func (q *durableQueue) runBackend(backend *httpBackend) {
 				continue
 			}
 			batchControl.success(len(batch.body), attemptDuration)
-			log.Printf("output %q HTTP 写入成功（status=%d, records=%d, bytes=%d, duration=%v, batch-limit=%dKB）",
-				backend.name, resp.StatusCode, len(batch.ids), len(batch.body), attemptDuration, batchControl.limit()/KB)
+			wireBytes, compressed := requestTransferStats(resp, len(batch.body))
+			log.Printf("output %q HTTP 写入成功（status=%d, records=%d, bytes=%d, wire-bytes=%d, compressed=%t, duration=%v, batch-limit=%dKB）",
+				backend.name, resp.StatusCode, len(batch.ids), len(batch.body), wireBytes, compressed, attemptDuration, batchControl.limit()/KB)
 			interval = queueInitialRetry
 			if interval > backend.maxDelay {
 				interval = backend.maxDelay
@@ -266,6 +267,7 @@ func (q *durableQueue) runBackend(backend *httpBackend) {
 
 		if postErr == nil && resp != nil && !isRetryableStatus(resp.StatusCode) {
 			reason := responseFailure(resp)
+			wireBytes, compressed := requestTransferStats(resp, len(batch.body))
 			evicted, err := q.moveToDead(backend, batch.ids, reason)
 			if err != nil {
 				log.Printf("移动 output %q 的不可重试记录到 dead-letter 失败: %v", backend.name, err)
@@ -275,8 +277,8 @@ func (q *durableQueue) runBackend(backend *httpBackend) {
 				interval = nextRetry(interval, backend.maxDelay)
 				continue
 			}
-			log.Printf("output %q HTTP 写入失败且不可重试，已将记录移入 dead-letter（records=%d, bytes=%d, duration=%v）: %s",
-				backend.name, len(batch.ids), len(batch.body), attemptDuration, reason)
+			log.Printf("output %q HTTP 写入失败且不可重试，已将记录移入 dead-letter（records=%d, bytes=%d, wire-bytes=%d, compressed=%t, duration=%v）: %s",
+				backend.name, len(batch.ids), len(batch.body), wireBytes, compressed, attemptDuration, reason)
 			if evicted > 0 {
 				log.Printf("output %q 的 dead-letter 达到上限，淘汰了 %d 条最旧记录", backend.name, evicted)
 			}
@@ -288,15 +290,16 @@ func (q *durableQueue) runBackend(backend *httpBackend) {
 		}
 
 		batchControl.failure()
+		wireBytes, compressed := requestTransferStats(resp, len(batch.body))
 		if postErr != nil {
-			log.Printf("output %q HTTP 写入失败，将重试（records=%d, bytes=%d, duration=%v, batch-limit=%dKB）: %v",
-				backend.name, len(batch.ids), len(batch.body), attemptDuration, batchControl.limit()/KB, postErr)
+			log.Printf("output %q HTTP 写入失败，将重试（records=%d, bytes=%d, wire-bytes=%d, compressed=%t, duration=%v, batch-limit=%dKB）: %v",
+				backend.name, len(batch.ids), len(batch.body), wireBytes, compressed, attemptDuration, batchControl.limit()/KB, postErr)
 		} else if resp != nil {
-			log.Printf("output %q HTTP 写入失败，将重试（records=%d, bytes=%d, duration=%v, batch-limit=%dKB）: %s",
-				backend.name, len(batch.ids), len(batch.body), attemptDuration, batchControl.limit()/KB, responseFailure(resp))
+			log.Printf("output %q HTTP 写入失败，将重试（records=%d, bytes=%d, wire-bytes=%d, compressed=%t, duration=%v, batch-limit=%dKB）: %s",
+				backend.name, len(batch.ids), len(batch.body), wireBytes, compressed, attemptDuration, batchControl.limit()/KB, responseFailure(resp))
 		} else {
-			log.Printf("output %q HTTP 写入失败，将重试（records=%d, bytes=%d, duration=%v, batch-limit=%dKB）: 未收到有效响应",
-				backend.name, len(batch.ids), len(batch.body), attemptDuration, batchControl.limit()/KB)
+			log.Printf("output %q HTTP 写入失败，将重试（records=%d, bytes=%d, wire-bytes=%d, compressed=%t, duration=%v, batch-limit=%dKB）: 未收到有效响应",
+				backend.name, len(batch.ids), len(batch.body), wireBytes, compressed, attemptDuration, batchControl.limit()/KB)
 		}
 
 		if !q.waitRetry(interval) {
@@ -304,6 +307,13 @@ func (q *durableQueue) runBackend(backend *httpBackend) {
 		}
 		interval = nextRetry(interval, backend.maxDelay)
 	}
+}
+
+func requestTransferStats(response *responseData, originalBytes int) (int, bool) {
+	if response == nil || response.requestBytes <= 0 {
+		return originalBytes, false
+	}
+	return response.requestBytes, response.compressed
 }
 
 func (q *durableQueue) peekBatch(backend *httpBackend, batchLimit int) (durableBatch, bool, error) {

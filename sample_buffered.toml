@@ -30,6 +30,10 @@ queue-path = "/var/lib/influxdb-relay/example-http.queue.db"
 #   ip-family：域名同时具有 A/AAAA 记录时的地址族策略，默认 auto。
 #              auto 使用 Go 默认双栈策略；prefer-ipv6 先连接 IPv6，300ms 后回退 IPv4；
 #              ipv6-only 仅连接 IPv6；ipv4-only 仅连接 IPv4。已有 HTTP 连接会继续复用。
+#   compression：发往该 output 的 HTTP 请求体压缩，可选 none、gzip，默认 none。
+#                gzip 仅在压缩后的正文确实更小时使用；InfluxDB /write 支持该格式。
+#   compression-min-kb：启用 gzip 的最小原始正文大小，默认 64KB。
+#                       小请求保持原文，避免 gzip 头和 CPU 开销反而增加成本。
 #   timeout：每次远端请求的超时，默认 10s。它不阻塞其他 output 或客户端 ACK。
 #   buffer-size-mb：该 output 活动队列的逻辑目标容量；空间不足时从队首淘汰。
 #                   dead-letter 另有同等上限，因此磁盘至少按所有该值之和的 2 倍规划。
@@ -45,7 +49,7 @@ queue-path = "/var/lib/influxdb-relay/example-http.queue.db"
 #   skip-tls-verification：跳过 TLS 证书校验，默认 false；仅限可信测试环境使用。
 output = [
     { name="local1", location="http://127.0.0.1:8086/write", timeout="10s", buffer-size-mb=100, max-batch-kb=512, max-delay-interval="5s", skip-tls-verification=false },
-    { name="local2", location="http://influxdb.example.com:7086/write", ip-family="prefer-ipv6", timeout="30s", buffer-size-mb=100, max-batch-kb=2048, adaptive-batch=true, min-batch-kb=128, target-batch-duration="5s", max-delay-interval="5s", skip-tls-verification=false },
+    { name="local2", location="http://influxdb.example.com:7086/write", ip-family="prefer-ipv6", compression="gzip", compression-min-kb=64, timeout="30s", buffer-size-mb=100, max-batch-kb=2048, adaptive-batch=true, min-batch-kb=128, target-batch-duration="5s", max-delay-interval="5s", skip-tls-verification=false },
 ]
 
 # 重试分类：网络错误、HTTP 408、425、429 和 5xx 会指数退避重试。

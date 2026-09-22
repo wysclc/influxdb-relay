@@ -39,6 +39,7 @@ output = [
     # name: name of the backend, used for display purposes only.
     # location: full URL of the /write endpoint of the backend
     # ip-family: auto、prefer-ipv6、ipv6-only 或 ipv4-only；默认 auto。
+    # compression/compression-min-kb: 出站压缩算法及最小原始正文大小。
     # timeout: Go-parseable time duration. Fail writes if incomplete in this time.
     # buffer-size-mb: 单个 output 的活动持久化队列上限。
     # max-batch-kb: 单个 output worker 合并的最大请求体；启用自适应时作为上限。
@@ -127,6 +128,8 @@ With this setup a failure of one Relay or one InfluxDB can be sustained while st
 * `queue-path`：该 HTTP relay 的 BoltDB 队列文件。默认位于 `/var/lib/influxdb-relay`。
 * `buffer-size-mb`：单个 output 活动队列的逻辑目标容量。空间不足时从队首淘汰最老记录。
 * `ip-family`：后端地址族策略，默认 `auto`。可设为 `prefer-ipv6`、`ipv6-only` 或 `ipv4-only`。
+* `compression`：发往该 output 的请求体压缩，支持 `none`（默认）和 `gzip`。
+* `compression-min-kb`：启用 gzip 的最小原始正文大小，默认 64KB。
 * `max-batch-kb`：worker 一次合并投递的最大请求体，默认 512KB；启用自适应后作为上限。
 * `adaptive-batch`：是否为该 output 启用自适应批量，默认 `false`。各 output 独立学习，互不影响。
 * `min-batch-kb`：自适应批量下限，默认 128KB，不能大于 `max-batch-kb`。
@@ -149,6 +152,8 @@ LIFO 优先保证远端尽快看到最新数据，但持续写入时旧记录可
 启用 `adaptive-batch` 后，worker 使用平滑后的端到端吞吐量估算下一批大小。慢速成功会逐步缩小批量，可重试错误会立即把批量减半，成功恢复时每次最多增长 25%，并始终限制在 `min-batch-kb` 与 `max-batch-kb` 之间。小于下限的零散请求不会参与估算。该上限只限制多条队列记录的合并：为了保持原始请求的完整投递和重试语义，单条记录不会拆分，因此可能大于当前批量上限。
 
 `ip-family="prefer-ipv6"` 会保留 `location` 中的域名作为 HTTP Host 和 HTTPS SNI，解析 A/AAAA 后先拨 IPv6；IPv6 在 300ms 内没有连接成功时，并行尝试 IPv4，先成功的连接被使用。`ipv6-only` 和 `ipv4-only` 不会回退到另一地址族。HTTP keep-alive 会复用已建立的连接，因此策略在新建连接时生效；启动日志会记录非 `auto` 策略，新连接日志会显示实际远端地址。
+
+`compression="gzip"` 会在发送前压缩达到 `compression-min-kb` 的正文，并设置 `Content-Encoding: gzip`。只有压缩结果比原文小时才实际使用 gzip。BoltDB 队列、容量限制和 `max-batch-kb` 始终按未压缩大小计算，因此开启压缩不改变持久化数据格式，也不影响已有队列。投递日志中的 `bytes` 是原始大小，`wire-bytes` 是 HTTP 请求体实际大小；两者不包含 HTTP/TCP/IP 协议头。
 
 对于已经入队的 output，投递保证是 **at-least-once**：relay 在远端写成功之后、删除 WAL 记录之前崩溃时，重启后会重放该记录。规范化后的点包含固定时间戳，因此重放相同 series/timestamp 通常由 InfluxDB 按覆盖写处理，但业务仍不应假设 exactly-once。
 

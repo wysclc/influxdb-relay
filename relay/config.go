@@ -42,6 +42,12 @@ type HTTPOutputConfig struct {
 	// 可选值为 auto、prefer-ipv6、ipv6-only、ipv4-only（Default auto）。
 	IPFamily string `toml:"ip-family"`
 
+	// Compression 控制发往该后端的 HTTP 请求体压缩（none 或 gzip，Default none）。
+	Compression string `toml:"compression"`
+
+	// CompressionMinKB 是启用 gzip 的最小原始正文大小（Default 64KB）。
+	CompressionMinKB int `toml:"compression-min-kb"`
+
 	// Timeout sets a per-backend timeout for write requests. (Default 10s)
 	// The format used is the same seen in time.ParseDuration
 	Timeout string `toml:"timeout"`

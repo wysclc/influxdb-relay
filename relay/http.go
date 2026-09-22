@@ -84,6 +84,10 @@ func NewHTTP(cfg HTTPConfig) (Relay, error) {
 		if backend.ipFamily != ipFamilyAuto {
 			log.Printf("HTTP relay %q 的 output %q 使用地址族策略 %q", h.Name(), backend.name, backend.ipFamily)
 		}
+		if backend.compression == httpCompressionGZIP {
+			log.Printf("HTTP relay %q 的 output %q 启用 gzip 出站压缩（min=%dKB）",
+				h.Name(), backend.name, backend.compressionMin/KB)
+		}
 		if backend.maxBuffered > 0 {
 			buffered++
 		}
@@ -369,6 +373,8 @@ type responseData struct {
 	ContentEncoding string
 	StatusCode      int
 	Body            []byte
+	requestBytes    int
+	compressed      bool
 }
 
 func (rd *responseData) Write(w http.ResponseWriter) {
@@ -398,11 +404,13 @@ type poster interface {
 }
 
 type simplePoster struct {
-	client   *http.Client
-	location string
+	client         *http.Client
+	location       string
+	compression    httpCompression
+	compressionMin int
 }
 
-func newSimplePoster(location string, timeout time.Duration, skipTLSVerification bool, family ipFamily, outputName string) *simplePoster {
+func newSimplePoster(location string, timeout time.Duration, skipTLSVerification bool, family ipFamily, outputName string, compression httpCompression, compressionMin int) *simplePoster {
 	// Configure custom transport for http.Client
 	// Used for support skip-tls-verification option
 	transport := &http.Transport{
@@ -427,55 +435,66 @@ func newSimplePoster(location string, timeout time.Duration, skipTLSVerification
 			Timeout:   timeout,
 			Transport: transport,
 		},
-		location: location,
+		location:       location,
+		compression:    compression,
+		compressionMin: compressionMin,
 	}
 }
 
 func (b *simplePoster) post(ctx context.Context, buf []byte, query string, auth string) (*responseData, error) {
-	req, err := http.NewRequestWithContext(ctx, "POST", b.location, bytes.NewReader(buf))
+	requestBody, compressed, err := compressHTTPBody(buf, b.compression, b.compressionMin)
+	if err != nil {
+		return nil, err
+	}
+	requestData := &responseData{requestBytes: len(requestBody), compressed: compressed}
+	req, err := http.NewRequestWithContext(ctx, "POST", b.location, bytes.NewReader(requestBody))
 	if err != nil {
 		return nil, err
 	}
 
 	req.URL.RawQuery = query
 	req.Header.Set("Content-Type", "text/plain")
-	req.Header.Set("Content-Length", strconv.Itoa(len(buf)))
+	req.Header.Set("Content-Length", strconv.Itoa(len(requestBody)))
+	if compressed {
+		req.Header.Set("Content-Encoding", "gzip")
+	}
 	if auth != "" {
 		req.Header.Set("Authorization", auth)
 	}
 
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return nil, err
+		return requestData, err
 	}
 
 	data, readErr := ioutil.ReadAll(resp.Body)
 	closeErr := resp.Body.Close()
 	if readErr != nil {
-		return nil, readErr
+		return requestData, readErr
 	}
 	if closeErr != nil {
-		return nil, closeErr
+		return requestData, closeErr
 	}
 
-	return &responseData{
-		ContentType:     resp.Header.Get("Content-Type"),
-		ContentEncoding: resp.Header.Get("Content-Encoding"),
-		StatusCode:      resp.StatusCode,
-		Body:            data,
-	}, nil
+	requestData.ContentType = resp.Header.Get("Content-Type")
+	requestData.ContentEncoding = resp.Header.Get("Content-Encoding")
+	requestData.StatusCode = resp.StatusCode
+	requestData.Body = data
+	return requestData, nil
 }
 
 type httpBackend struct {
 	poster
-	name        string
-	maxBuffered int64
-	maxBatch    int
-	minBatch    int
-	adaptive    bool
-	targetBatch time.Duration
-	maxDelay    time.Duration
-	ipFamily    ipFamily
+	name           string
+	maxBuffered    int64
+	maxBatch       int
+	minBatch       int
+	adaptive       bool
+	targetBatch    time.Duration
+	maxDelay       time.Duration
+	ipFamily       ipFamily
+	compression    httpCompression
+	compressionMin int
 }
 
 func newHTTPBackend(cfg *HTTPOutputConfig) (*httpBackend, error) {
@@ -485,6 +504,16 @@ func newHTTPBackend(cfg *HTTPOutputConfig) (*httpBackend, error) {
 	family, err := parseIPFamily(cfg.IPFamily)
 	if err != nil {
 		return nil, err
+	}
+	compression, err := parseHTTPCompression(cfg.Compression)
+	if err != nil {
+		return nil, err
+	}
+	compressionMin := DefaultCompressionMinKB * KB
+	if cfg.CompressionMinKB > 0 {
+		compressionMin = cfg.CompressionMinKB * KB
+	} else if cfg.CompressionMinKB < 0 {
+		return nil, errors.New("compression-min-kb 不能为负数")
 	}
 
 	timeout := DefaultHTTPTimeout
@@ -545,15 +574,17 @@ func newHTTPBackend(cfg *HTTPOutputConfig) (*httpBackend, error) {
 	}
 
 	return &httpBackend{
-		poster:      newSimplePoster(cfg.Location, timeout, cfg.SkipTLSVerification, family, cfg.Name),
-		name:        cfg.Name,
-		maxBuffered: int64(cfg.BufferSizeMB) * MB,
-		maxBatch:    batch,
-		minBatch:    minBatch,
-		adaptive:    cfg.AdaptiveBatch,
-		targetBatch: targetBatch,
-		maxDelay:    max,
-		ipFamily:    family,
+		poster:         newSimplePoster(cfg.Location, timeout, cfg.SkipTLSVerification, family, cfg.Name, compression, compressionMin),
+		name:           cfg.Name,
+		maxBuffered:    int64(cfg.BufferSizeMB) * MB,
+		maxBatch:       batch,
+		minBatch:       minBatch,
+		adaptive:       cfg.AdaptiveBatch,
+		targetBatch:    targetBatch,
+		maxDelay:       max,
+		ipFamily:       family,
+		compression:    compression,
+		compressionMin: compressionMin,
 	}, nil
 }
 

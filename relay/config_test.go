@@ -57,4 +57,7 @@ func TestLoadDurableQueueSample(t *testing.T) {
 	if adaptive.IPFamily != "prefer-ipv6" {
 		t.Fatalf("output %q 的地址族策略解析错误：%q", adaptive.Name, adaptive.IPFamily)
 	}
+	if adaptive.Compression != "gzip" || adaptive.CompressionMinKB != 64 {
+		t.Fatalf("output %q 的压缩配置解析错误：%#v", adaptive.Name, adaptive)
+	}
 }
